@@ -2,10 +2,10 @@ package server
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"clawcolony/internal/store"
 )
@@ -25,53 +25,53 @@ func proposeCollabForTest(t *testing.T, srv *Server, actor authUser, payload map
 	return resp.Item
 }
 
-func assignCollabForTest(t *testing.T, srv *Server, actor authUser, collabID string, assignments []map[string]any, note string) {
+func updateUpgradePRForTest(t *testing.T, srv *Server, actor authUser, payload map[string]any) store.CollabSession {
 	t.Helper()
-	w := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/assign", map[string]any{
-		"collab_id":              collabID,
-		"assignments":            assignments,
-		"status_or_summary_note": note,
-	}, actor.headers())
-	if w.Code != http.StatusAccepted {
-		t.Fatalf("collab assign status=%d body=%s", w.Code, w.Body.String())
+	w := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/update-pr", payload, actor.headers())
+	if w.Code != http.StatusOK {
+		t.Fatalf("collab update-pr status=%d body=%s", w.Code, w.Body.String())
 	}
+	var resp struct {
+		Item store.CollabSession `json:"item"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode collab update-pr response: %v", err)
+	}
+	return resp.Item
 }
 
-func startCollabForTest(t *testing.T, srv *Server, actor authUser, collabID, note string) {
+func applyUpgradePRReviewForTest(t *testing.T, srv *Server, actor authUser, collabID, evidenceURL string) store.CollabParticipant {
 	t.Helper()
-	w := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/start", map[string]any{
-		"collab_id":              collabID,
-		"status_or_summary_note": note,
+	w := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/apply", map[string]any{
+		"collab_id":        collabID,
+		"application_kind": "review",
+		"evidence_url":     evidenceURL,
 	}, actor.headers())
 	if w.Code != http.StatusAccepted {
-		t.Fatalf("collab start status=%d body=%s", w.Code, w.Body.String())
+		t.Fatalf("review apply status=%d body=%s", w.Code, w.Body.String())
 	}
-}
-
-func submitReviewVerdictForTest(t *testing.T, srv *Server, actor authUser, collabID, headSHA, verdict string) {
-	t.Helper()
-	summary := fmt.Sprintf("%s: reviewed %s", verdict, headSHA)
-	content := fmt.Sprintf(
-		"result=completed review\ncollab_id=%s\nreviewed_head_sha=%s\nverdict=%s\nfindings=none\nverification=read diff and ran go test ./...\nnext=pr_owner may continue once merge gate is satisfied",
-		collabID,
-		headSHA,
-		verdict,
-	)
-	w := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/submit", map[string]any{
-		"collab_id": collabID,
-		"role":      "reviewer",
-		"kind":      "review_verdict",
-		"summary":   summary,
-		"content":   content,
-	}, actor.headers())
-	if w.Code != http.StatusAccepted {
-		t.Fatalf("review verdict submit status=%d body=%s", w.Code, w.Body.String())
+	var resp struct {
+		Item store.CollabParticipant `json:"item"`
 	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode review apply response: %v", err)
+	}
+	return resp.Item
 }
 
 func TestCollabUpgradePRRequiresPRRepoAndListKindFilter(t *testing.T) {
 	srv := newTestServer()
 	proposer := newAuthUser(t, srv)
+	fixture := newFakeUpgradePRGitHub(t, "agi-bar/clawcolony", 41)
+	fixture.pull = githubPullRequestRecord{
+		Number:  41,
+		State:   "open",
+		HTMLURL: fixture.pullURL(),
+	}
+	fixture.pull.Head.SHA = "head-sha-1111111"
+	fixture.pull.Head.Ref = "feature/runtime-pr-parity"
+	fixture.pull.Base.SHA = "base-sha-0000000"
+	fixture.pull.User.Login = "author-login"
 
 	bad := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/propose", map[string]any{
 		"title": "Runtime PR parity",
@@ -84,18 +84,53 @@ func TestCollabUpgradePRRequiresPRRepoAndListKindFilter(t *testing.T) {
 	if !strings.Contains(bad.Body.String(), "pr_repo is required for kind=upgrade_pr") {
 		t.Fatalf("missing pr_repo error mismatch: %s", bad.Body.String())
 	}
+	missingPRURL := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/propose", map[string]any{
+		"title":   "Runtime PR parity",
+		"goal":    "Restore upgrade_pr behavior",
+		"kind":    "upgrade_pr",
+		"pr_repo": "agi-bar/clawcolony",
+	}, proposer.headers())
+	if missingPRURL.Code != http.StatusBadRequest || !strings.Contains(missingPRURL.Body.String(), "pr_url is required for kind=upgrade_pr") {
+		t.Fatalf("missing pr_url should fail, got=%d body=%s", missingPRURL.Code, missingPRURL.Body.String())
+	}
 
 	upgrade := proposeCollabForTest(t, srv, proposer, map[string]any{
 		"title":       "Runtime PR parity",
 		"goal":        "Restore upgrade_pr behavior",
 		"kind":        "upgrade_pr",
 		"pr_repo":     "agi-bar/clawcolony",
+		"pr_url":      fixture.pullURL(),
 		"complexity":  "high",
 		"min_members": 3,
 		"max_members": 3,
 	})
 	if upgrade.Kind != "upgrade_pr" || upgrade.PRRepo != "agi-bar/clawcolony" {
 		t.Fatalf("upgrade_pr collab fields mismatch: %+v", upgrade)
+	}
+	if upgrade.Phase != "reviewing" {
+		t.Fatalf("upgrade_pr should start in reviewing after PR-first propose, got=%s", upgrade.Phase)
+	}
+	if upgrade.AuthorUserID != proposer.id {
+		t.Fatalf("upgrade_pr should auto-select proposer as author, got=%s want=%s", upgrade.AuthorUserID, proposer.id)
+	}
+	if upgrade.MinMembers != 1 || upgrade.MaxMembers != 1 || upgrade.RequiredReviewers != 2 {
+		t.Fatalf("upgrade_pr should force author-led limits, got=%+v", upgrade)
+	}
+	if upgrade.PRURL != fixture.pullURL() || upgrade.PRNumber != 41 || upgrade.PRBranch != "feature/runtime-pr-parity" {
+		t.Fatalf("upgrade_pr propose should persist PR metadata, got=%+v", upgrade)
+	}
+	if upgrade.PRHeadSHA != "head-sha-1111111" || upgrade.PRBaseSHA != "base-sha-0000000" || upgrade.GitHubPRState != "open" {
+		t.Fatalf("upgrade_pr propose should fetch GitHub PR state, got=%+v", upgrade)
+	}
+	if upgrade.ReviewDeadlineAt == nil {
+		t.Fatalf("upgrade_pr propose should set review deadline")
+	}
+	parts, err := srv.store.ListCollabParticipants(t.Context(), upgrade.CollabID, "", 20)
+	if err != nil {
+		t.Fatalf("list participants: %v", err)
+	}
+	if len(parts) != 1 || parts[0].UserID != proposer.id || parts[0].Role != "author" || parts[0].Status != "selected" {
+		t.Fatalf("expected proposer to be the only selected author, got=%+v", parts)
 	}
 
 	general := proposeCollabForTest(t, srv, proposer, map[string]any{
@@ -124,201 +159,256 @@ func TestCollabUpgradePRRequiresPRRepoAndListKindFilter(t *testing.T) {
 	}
 }
 
-func TestCollabUpdatePRPermissionsAndFields(t *testing.T) {
+func TestCollabUpgradePRAuthorLedUpdateAndApplyFlow(t *testing.T) {
 	srv := newTestServer()
 	proposer := newAuthUser(t, srv)
-	author := newAuthUser(t, srv)
 	reviewer := newAuthUser(t, srv)
 	outsider := newAuthUser(t, srv)
+	fixture := newFakeUpgradePRGitHub(t, "agi-bar/clawcolony", 42)
+	fixture.pull = githubPullRequestRecord{
+		Number:  42,
+		State:   "open",
+		HTMLURL: fixture.pullURL(),
+	}
+	fixture.pull.Head.SHA = "head-sha-2222222"
+	fixture.pull.Head.Ref = "feature/runtime-pr-parity"
+	fixture.pull.Base.SHA = "base-sha-1111111"
+	fixture.pull.User.Login = "author-login"
 
 	general := proposeCollabForTest(t, srv, proposer, map[string]any{
 		"title": "General runtime cleanup",
 		"goal":  "Exercise non-PR collab guardrails",
 	})
-	w := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/update-pr", map[string]any{
-		"collab_id":   general.CollabID,
-		"pr_url":      "https://github.com/agi-bar/clawcolony/pull/1",
-		"pr_branch":   "feature/general",
-		"pr_base_sha": "base-general",
-		"pr_head_sha": "head-general",
+	generalUpdate := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/update-pr", map[string]any{
+		"collab_id": general.CollabID,
+		"pr_url":    fixture.pullURL(),
 	}, proposer.headers())
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("general collab update-pr should return 400, got=%d body=%s", w.Code, w.Body.String())
+	if generalUpdate.Code != http.StatusBadRequest {
+		t.Fatalf("general collab update-pr should return 400, got=%d body=%s", generalUpdate.Code, generalUpdate.Body.String())
 	}
 
 	upgrade := proposeCollabForTest(t, srv, proposer, map[string]any{
-		"title":       "Upgrade PR runtime parity",
-		"goal":        "Restore PR metadata endpoints",
-		"kind":        "upgrade_pr",
-		"pr_repo":     "agi-bar/clawcolony",
-		"min_members": 2,
-		"max_members": 3,
+		"title":   "Upgrade PR runtime parity",
+		"goal":    "Restore PR metadata endpoints",
+		"kind":    "upgrade_pr",
+		"pr_repo": "agi-bar/clawcolony",
+		"pr_url":  fixture.pullURL(),
 	})
-	assignCollabForTest(t, srv, proposer, upgrade.CollabID, []map[string]any{
-		{"user_id": author.id, "role": "author"},
-		{"user_id": reviewer.id, "role": "reviewer"},
-	}, "assign author and reviewer")
 
-	reviewerUpdate := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/update-pr", map[string]any{
+	assign := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/assign", map[string]any{
 		"collab_id":   upgrade.CollabID,
-		"pr_url":      "https://github.com/agi-bar/clawcolony/pull/42",
-		"pr_branch":   "feature/reviewer",
-		"pr_base_sha": "base-reviewer",
-		"pr_head_sha": "head-reviewer",
-	}, reviewer.headers())
-	if reviewerUpdate.Code != http.StatusForbidden {
-		t.Fatalf("reviewer update-pr should return 403, got=%d body=%s", reviewerUpdate.Code, reviewerUpdate.Body.String())
+		"assignments": []map[string]any{{"user_id": reviewer.id, "role": "reviewer"}},
+	}, proposer.headers())
+	if assign.Code != http.StatusConflict || !strings.Contains(assign.Body.String(), "assign is not used") {
+		t.Fatalf("upgrade_pr assign should be rejected, got=%d body=%s", assign.Code, assign.Body.String())
+	}
+
+	start := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/start", map[string]any{
+		"collab_id": upgrade.CollabID,
+	}, proposer.headers())
+	if start.Code != http.StatusConflict || !strings.Contains(start.Body.String(), "start is not used") {
+		t.Fatalf("upgrade_pr start should be rejected, got=%d body=%s", start.Code, start.Body.String())
 	}
 
 	outsiderUpdate := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/update-pr", map[string]any{
-		"collab_id":   upgrade.CollabID,
-		"pr_url":      "https://github.com/agi-bar/clawcolony/pull/42",
-		"pr_branch":   "feature/outsider",
-		"pr_base_sha": "base-outsider",
-		"pr_head_sha": "head-outsider",
+		"collab_id": upgrade.CollabID,
+		"pr_url":    fixture.pullURL(),
 	}, outsider.headers())
 	if outsiderUpdate.Code != http.StatusForbidden {
 		t.Fatalf("outsider update-pr should return 403, got=%d body=%s", outsiderUpdate.Code, outsiderUpdate.Body.String())
 	}
 
-	authorUpdate := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/update-pr", map[string]any{
-		"collab_id":   upgrade.CollabID,
-		"pr_url":      "https://github.com/agi-bar/clawcolony/pull/42",
-		"pr_branch":   "feature/runtime-pr-parity",
-		"pr_base_sha": "base-sha-1111111",
-		"pr_head_sha": "head-sha-2222222",
-	}, author.headers())
-	if authorUpdate.Code != http.StatusOK {
-		t.Fatalf("author update-pr status=%d body=%s", authorUpdate.Code, authorUpdate.Body.String())
+	updated := updateUpgradePRForTest(t, srv, proposer, map[string]any{
+		"collab_id": upgrade.CollabID,
+		"pr_branch": "feature/runtime-pr-parity-v2",
+	})
+	if updated.Phase != "reviewing" {
+		t.Fatalf("upgrade_pr should remain in reviewing, got=%s", updated.Phase)
 	}
-	var authorResp struct {
-		Item store.CollabSession `json:"item"`
+	if updated.PRURL != fixture.pullURL() || updated.PRNumber != 42 || updated.PRBranch != "feature/runtime-pr-parity-v2" {
+		t.Fatalf("update-pr should persist PR metadata, got=%+v", updated)
 	}
-	if err := json.Unmarshal(authorUpdate.Body.Bytes(), &authorResp); err != nil {
-		t.Fatalf("decode author update-pr response: %v", err)
+	if updated.PRBaseSHA != "base-sha-1111111" || updated.PRHeadSHA != "head-sha-2222222" {
+		t.Fatalf("update-pr should trust GitHub head/base, got=%+v", updated)
 	}
-	if authorResp.Item.PRURL != "https://github.com/agi-bar/clawcolony/pull/42" || authorResp.Item.PRHeadSHA != "head-sha-2222222" {
-		t.Fatalf("author update-pr did not persist fields: %+v", authorResp.Item)
+	if updated.PRAuthorLogin != "author-login" || updated.GitHubPRState != "open" {
+		t.Fatalf("update-pr should save GitHub author/state, got=%+v", updated)
+	}
+	if updated.ReviewDeadlineAt == nil || upgrade.ReviewDeadlineAt == nil || !updated.ReviewDeadlineAt.Equal(*upgrade.ReviewDeadlineAt) {
+		t.Fatalf("update-pr should preserve original review deadline, upgrade=%v updated=%v", upgrade.ReviewDeadlineAt, updated.ReviewDeadlineAt)
+	}
+	rebound := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/update-pr", map[string]any{
+		"collab_id": upgrade.CollabID,
+		"pr_url":    "https://github.com/agi-bar/clawcolony/pull/999",
+	}, proposer.headers())
+	if rebound.Code != http.StatusConflict || !strings.Contains(rebound.Body.String(), "already bound to a pull request") {
+		t.Fatalf("upgrade_pr should not allow rebinding to another PR, got=%d body=%s", rebound.Code, rebound.Body.String())
 	}
 
-	proposerUpdate := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/update-pr", map[string]any{
-		"collab_id":   upgrade.CollabID,
-		"pr_head_sha": "head-sha-3333333",
-	}, proposer.headers())
-	if proposerUpdate.Code != http.StatusOK {
-		t.Fatalf("proposer update-pr status=%d body=%s", proposerUpdate.Code, proposerUpdate.Body.String())
+	fixture.comments[9001] = makeUpgradePRApplyComment(fixturesRepoOrDefault(fixture.repo), fixture.number, 9001, "reviewer-one", upgrade.CollabID, reviewer.id, "I can review this change.")
+	badApply := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/apply", map[string]any{
+		"collab_id":        upgrade.CollabID,
+		"application_kind": "review",
+		"evidence_url":     fixture.commentURL(9001),
+	}, outsider.headers())
+	if badApply.Code != http.StatusBadRequest || !strings.Contains(badApply.Body.String(), "user_id does not match") {
+		t.Fatalf("review apply with mismatched user should fail, got=%d body=%s", badApply.Code, badApply.Body.String())
 	}
-	var proposerResp struct {
-		Item store.CollabSession `json:"item"`
+
+	reviewApply := applyUpgradePRReviewForTest(t, srv, reviewer, upgrade.CollabID, fixture.commentURL(9001))
+	if !reviewApply.Verified || reviewApply.ApplicationKind != "review" || reviewApply.GitHubLogin != "reviewer-one" {
+		t.Fatalf("review apply should capture verification details, got=%+v", reviewApply)
 	}
-	if err := json.Unmarshal(proposerUpdate.Body.Bytes(), &proposerResp); err != nil {
-		t.Fatalf("decode proposer update-pr response: %v", err)
+	if reviewApply.Pitch != "I can review this change." {
+		t.Fatalf("review apply pitch should come from comment note, got=%q", reviewApply.Pitch)
 	}
-	if proposerResp.Item.PRHeadSHA != "head-sha-3333333" || proposerResp.Item.PRBranch != "feature/runtime-pr-parity" {
-		t.Fatalf("proposer update-pr should preserve existing branch and replace head sha: %+v", proposerResp.Item)
+
+	discussionApply := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/apply", map[string]any{
+		"collab_id":        upgrade.CollabID,
+		"application_kind": "discussion",
+		"pitch":            "I have suggestions but no GitHub review today.",
+	}, outsider.headers())
+	if discussionApply.Code != http.StatusAccepted {
+		t.Fatalf("discussion apply status=%d body=%s", discussionApply.Code, discussionApply.Body.String())
+	}
+
+	parts, err := srv.store.ListCollabParticipants(t.Context(), upgrade.CollabID, "", 20)
+	if err != nil {
+		t.Fatalf("list participants: %v", err)
+	}
+	if len(parts) != 3 {
+		t.Fatalf("expected author + reviewer + discussion participant, got=%+v", parts)
 	}
 }
 
-func TestCollabMergeGateCountsOnlyApprovalsAtCurrentHead(t *testing.T) {
+func TestCollabUpgradePRMergeGateUsesGitHubReviewsAndStaleHeads(t *testing.T) {
 	srv := newTestServer()
-	proposer := newAuthUser(t, srv)
 	author := newAuthUser(t, srv)
 	reviewerOne := newAuthUser(t, srv)
 	reviewerTwo := newAuthUser(t, srv)
+	fixture := newFakeUpgradePRGitHub(t, "agi-bar/clawcolony", 77)
+	fixture.pull = githubPullRequestRecord{
+		Number:  77,
+		State:   "open",
+		HTMLURL: fixture.pullURL(),
+	}
+	fixture.pull.Base.SHA = "sha-base-0000000"
+	fixture.pull.Head.SHA = "sha-head-1111111"
+	fixture.pull.Head.Ref = "feature/merge-gate"
+	fixture.pull.User.Login = "author-login"
 
-	upgrade := proposeCollabForTest(t, srv, proposer, map[string]any{
-		"title":       "Merge gate head-sha tracking",
-		"goal":        "Ensure stale review verdicts do not count",
-		"kind":        "upgrade_pr",
-		"pr_repo":     "agi-bar/clawcolony",
-		"min_members": 3,
-		"max_members": 3,
+	upgrade := proposeCollabForTest(t, srv, author, map[string]any{
+		"title":   "Merge gate head-sha tracking",
+		"goal":    "Ensure stale GitHub reviews do not count",
+		"kind":    "upgrade_pr",
+		"pr_repo": "agi-bar/clawcolony",
+		"pr_url":  fixture.pullURL(),
 	})
-	assignCollabForTest(t, srv, proposer, upgrade.CollabID, []map[string]any{
-		{"user_id": author.id, "role": "author"},
-		{"user_id": reviewerOne.id, "role": "reviewer"},
-		{"user_id": reviewerTwo.id, "role": "reviewer"},
-	}, "assign author and two reviewers")
-	startCollabForTest(t, srv, proposer, upgrade.CollabID, "execution started")
 
-	oldHead := "sha-old-1111111"
-	newHead := "sha-new-2222222"
+	fixture.comments[1001] = makeUpgradePRApplyComment(fixturesRepoOrDefault(fixture.repo), fixture.number, 1001, "reviewer-one", upgrade.CollabID, reviewerOne.id, "reviewer one")
+	fixture.comments[1002] = makeUpgradePRApplyComment(fixturesRepoOrDefault(fixture.repo), fixture.number, 1002, "reviewer-two", upgrade.CollabID, reviewerTwo.id, "reviewer two")
+	fixture.comments[1003] = makeUpgradePRApplyComment(fixturesRepoOrDefault(fixture.repo), fixture.number, 1003, "author-login", upgrade.CollabID, author.id, "author self-review")
+	applyUpgradePRReviewForTest(t, srv, reviewerOne, upgrade.CollabID, fixture.commentURL(1001))
+	applyUpgradePRReviewForTest(t, srv, reviewerTwo, upgrade.CollabID, fixture.commentURL(1002))
+	applyUpgradePRReviewForTest(t, srv, author, upgrade.CollabID, fixture.commentURL(1003))
 
-	authorUpdate := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/update-pr", map[string]any{
-		"collab_id":   upgrade.CollabID,
-		"pr_url":      "https://github.com/agi-bar/clawcolony/pull/77",
-		"pr_branch":   "feature/merge-gate",
-		"pr_base_sha": "sha-base-0000000",
-		"pr_head_sha": oldHead,
-	}, author.headers())
-	if authorUpdate.Code != http.StatusOK {
-		t.Fatalf("seed old head update-pr status=%d body=%s", authorUpdate.Code, authorUpdate.Body.String())
+	headOne := fixture.pull.Head.SHA
+	fixture.reviews = []githubPullReviewRecord{
+		makeUpgradePRReview(1, "reviewer-one", "APPROVED", upgrade.CollabID, headOne, "agree", "looks good", "none", time.Now().Add(-5*time.Minute)),
+		makeUpgradePRReview(2, "reviewer-two", "COMMENTED", upgrade.CollabID, headOne, "disagree", "needs one change", "key issue", time.Now().Add(-4*time.Minute)),
+		makeUpgradePRReview(3, "author-login", "APPROVED", upgrade.CollabID, headOne, "agree", "self approval", "none", time.Now().Add(-3*time.Minute)),
 	}
-
-	submitReviewVerdictForTest(t, srv, reviewerOne, upgrade.CollabID, oldHead, "approve")
-
-	proposerUpdate := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/update-pr", map[string]any{
-		"collab_id":   upgrade.CollabID,
-		"pr_head_sha": newHead,
-	}, proposer.headers())
-	if proposerUpdate.Code != http.StatusOK {
-		t.Fatalf("update new head status=%d body=%s", proposerUpdate.Code, proposerUpdate.Body.String())
-	}
-
-	submitReviewVerdictForTest(t, srv, reviewerOne, upgrade.CollabID, newHead, "approve")
 
 	before := doJSONRequest(t, srv.mux, http.MethodGet, "/api/v1/collab/merge-gate?collab_id="+upgrade.CollabID, nil)
 	if before.Code != http.StatusOK {
-		t.Fatalf("merge gate before second approval status=%d body=%s", before.Code, before.Body.String())
+		t.Fatalf("merge gate status=%d body=%s", before.Code, before.Body.String())
 	}
 	var beforeResp struct {
-		CollabID        string   `json:"collab_id"`
-		PRHeadSHA       string   `json:"pr_head_sha"`
-		Approvals       int      `json:"approvals"`
-		ApprovalsAtHead int      `json:"approvals_at_head"`
-		StaleVerdicts   int      `json:"stale_verdicts"`
-		Mergeable       bool     `json:"mergeable"`
-		Blockers        []string `json:"blockers"`
+		CollabID             string   `json:"collab_id"`
+		PRHeadSHA            string   `json:"pr_head_sha"`
+		ValidReviewersAtHead int      `json:"valid_reviewers_at_head"`
+		ApprovalsAtHead      int      `json:"approvals_at_head"`
+		DisagreementsAtHead  int      `json:"disagreements_at_head"`
+		ReviewComplete       bool     `json:"review_complete"`
+		Mergeable            bool     `json:"mergeable"`
+		Blockers             []string `json:"blockers"`
 	}
 	if err := json.Unmarshal(before.Body.Bytes(), &beforeResp); err != nil {
-		t.Fatalf("decode merge gate before response: %v", err)
+		t.Fatalf("decode merge gate response: %v", err)
 	}
-	if beforeResp.CollabID != upgrade.CollabID || beforeResp.PRHeadSHA != newHead {
-		t.Fatalf("merge gate should report current collab/head: %+v", beforeResp)
+	if beforeResp.CollabID != upgrade.CollabID || beforeResp.PRHeadSHA != headOne {
+		t.Fatalf("merge gate should report current collab/head, got=%+v", beforeResp)
 	}
-	if beforeResp.Approvals != 2 || beforeResp.ApprovalsAtHead != 1 || beforeResp.StaleVerdicts != 1 {
-		t.Fatalf("merge gate counts before second approval mismatch: %+v", beforeResp)
+	if beforeResp.ValidReviewersAtHead != 2 || beforeResp.ApprovalsAtHead != 1 || beforeResp.DisagreementsAtHead != 1 {
+		t.Fatalf("merge gate should count two reviewers and ignore author self-review, got=%+v", beforeResp)
+	}
+	if !beforeResp.ReviewComplete {
+		t.Fatalf("two valid reviewers should complete review, got=%+v", beforeResp)
 	}
 	if beforeResp.Mergeable {
-		t.Fatalf("merge gate should block with only one approval at current head: %+v", beforeResp)
+		t.Fatalf("one approval plus one disagree should not be mergeable, got=%+v", beforeResp)
 	}
-	if len(beforeResp.Blockers) == 0 || !strings.Contains(beforeResp.Blockers[0], "need 2 approvals at current head_sha") {
-		t.Fatalf("merge gate blockers should mention current head approval requirement: %+v", beforeResp)
+	if len(beforeResp.Blockers) == 0 || !strings.Contains(strings.Join(beforeResp.Blockers, "\n"), "need 2 approvals at current head_sha") {
+		t.Fatalf("merge gate should still require two approvals, got=%+v", beforeResp)
 	}
 
-	submitReviewVerdictForTest(t, srv, reviewerTwo, upgrade.CollabID, newHead, "approve")
-
+	fixture.reviews = append(fixture.reviews, makeUpgradePRReview(4, "reviewer-two", "APPROVED", upgrade.CollabID, headOne, "agree", "follow-up agree", "none", time.Now().Add(-2*time.Minute)))
 	after := doJSONRequest(t, srv.mux, http.MethodGet, "/api/v1/collab/merge-gate?collab_id="+upgrade.CollabID, nil)
 	if after.Code != http.StatusOK {
-		t.Fatalf("merge gate after second approval status=%d body=%s", after.Code, after.Body.String())
+		t.Fatalf("merge gate after approval status=%d body=%s", after.Code, after.Body.String())
 	}
 	var afterResp struct {
-		Approvals       int      `json:"approvals"`
-		ApprovalsAtHead int      `json:"approvals_at_head"`
-		StaleVerdicts   int      `json:"stale_verdicts"`
-		Mergeable       bool     `json:"mergeable"`
-		Blockers        []string `json:"blockers"`
+		ValidReviewersAtHead int      `json:"valid_reviewers_at_head"`
+		ApprovalsAtHead      int      `json:"approvals_at_head"`
+		DisagreementsAtHead  int      `json:"disagreements_at_head"`
+		ReviewComplete       bool     `json:"review_complete"`
+		Mergeable            bool     `json:"mergeable"`
+		Blockers             []string `json:"blockers"`
 	}
 	if err := json.Unmarshal(after.Body.Bytes(), &afterResp); err != nil {
-		t.Fatalf("decode merge gate after response: %v", err)
+		t.Fatalf("decode merge gate after approval: %v", err)
 	}
-	if afterResp.Approvals != 3 || afterResp.ApprovalsAtHead != 2 || afterResp.StaleVerdicts != 1 {
-		t.Fatalf("merge gate counts after second approval mismatch: %+v", afterResp)
+	if afterResp.ValidReviewersAtHead != 2 || afterResp.ApprovalsAtHead != 2 || afterResp.DisagreementsAtHead != 0 {
+		t.Fatalf("latest reviewer judgement should replace older disagree, got=%+v", afterResp)
 	}
-	if !afterResp.Mergeable {
-		t.Fatalf("merge gate should become mergeable after two current-head approvals: %+v", afterResp)
+	if !afterResp.ReviewComplete || !afterResp.Mergeable || len(afterResp.Blockers) != 0 {
+		t.Fatalf("two current-head approvals should clear merge gate, got=%+v", afterResp)
 	}
-	if len(afterResp.Blockers) != 0 {
-		t.Fatalf("merge gate blockers should clear after approvals: %+v", afterResp)
+
+	fixture.pull.Head.SHA = "sha-head-2222222"
+	updateUpgradePRForTest(t, srv, author, map[string]any{
+		"collab_id": upgrade.CollabID,
+	})
+	stale := doJSONRequest(t, srv.mux, http.MethodGet, "/api/v1/collab/merge-gate?collab_id="+upgrade.CollabID, nil)
+	if stale.Code != http.StatusOK {
+		t.Fatalf("merge gate after head change status=%d body=%s", stale.Code, stale.Body.String())
 	}
+	var staleResp struct {
+		PRHeadSHA            string   `json:"pr_head_sha"`
+		ValidReviewersAtHead int      `json:"valid_reviewers_at_head"`
+		ApprovalsAtHead      int      `json:"approvals_at_head"`
+		ReviewComplete       bool     `json:"review_complete"`
+		Mergeable            bool     `json:"mergeable"`
+		Blockers             []string `json:"blockers"`
+	}
+	if err := json.Unmarshal(stale.Body.Bytes(), &staleResp); err != nil {
+		t.Fatalf("decode merge gate after head change: %v", err)
+	}
+	if staleResp.PRHeadSHA != "sha-head-2222222" {
+		t.Fatalf("merge gate should track the new head, got=%+v", staleResp)
+	}
+	if staleResp.ValidReviewersAtHead != 0 || staleResp.ApprovalsAtHead != 0 || staleResp.ReviewComplete || staleResp.Mergeable {
+		t.Fatalf("old-head reviews should go stale on new head, got=%+v", staleResp)
+	}
+	if len(staleResp.Blockers) == 0 || !strings.Contains(strings.Join(staleResp.Blockers, "\n"), "need 2 valid reviewers at current head_sha") {
+		t.Fatalf("stale head blockers mismatch, got=%+v", staleResp)
+	}
+}
+
+func fixturesRepoOrDefault(repo string) string {
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return "agi-bar/clawcolony"
+	}
+	return repo
 }

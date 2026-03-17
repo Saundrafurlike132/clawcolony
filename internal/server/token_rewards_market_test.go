@@ -26,6 +26,26 @@ func tokenBalanceForUser(t *testing.T, srv *Server, userID string) int64 {
 	return payload.Item.Balance
 }
 
+func setupUpgradePRRewardFlowForTest(t *testing.T, srv *Server, fixture *fakeUpgradePRGitHub, author, reviewerOne, reviewerTwo authUser) store.CollabSession {
+	t.Helper()
+	collab := proposeCollabForTest(t, srv, author, map[string]any{
+		"title":   "Rewarded upgrade PR",
+		"goal":    "Exercise runtime upgrade_pr rewards",
+		"kind":    "upgrade_pr",
+		"pr_repo": fixture.repo,
+		"pr_url":  fixture.pullURL(),
+	})
+	collab = updateUpgradePRForTest(t, srv, author, map[string]any{
+		"collab_id": collab.CollabID,
+		"pr_branch": "feature/rewarded-upgrade",
+	})
+	fixture.comments[2001] = makeUpgradePRApplyComment(fixturesRepoOrDefault(fixture.repo), fixture.number, 2001, "reviewer-one", collab.CollabID, reviewerOne.id, "reviewer one")
+	fixture.comments[2002] = makeUpgradePRApplyComment(fixturesRepoOrDefault(fixture.repo), fixture.number, 2002, "reviewer-two", collab.CollabID, reviewerTwo.id, "reviewer two")
+	applyUpgradePRReviewForTest(t, srv, reviewerOne, collab.CollabID, fixture.commentURL(2001))
+	applyUpgradePRReviewForTest(t, srv, reviewerTwo, collab.CollabID, fixture.commentURL(2002))
+	return collab
+}
+
 func TestKBProposalApplyGrantsCommunityReward(t *testing.T) {
 	srv := newTestServer()
 	ctx := context.Background()
@@ -191,6 +211,201 @@ func TestCollabCloseRewardsEachAcceptedArtifact(t *testing.T) {
 	want := int64(1000 + 2*communityRewardAmountCollabClose)
 	if got := tokenBalanceForUser(t, srv, author); got != want {
 		t.Fatalf("author balance=%d want %d body=%s", got, want, w.Body.String())
+	}
+}
+
+func TestUpgradePRCloseDoesNotGrantLegacyCollabReward(t *testing.T) {
+	srv := newTestServer()
+	author := newAuthUser(t, srv)
+	fixture := newFakeUpgradePRGitHub(t, "agi-bar/clawcolony", 90)
+	fixture.pull = githubPullRequestRecord{
+		Number:  90,
+		State:   "open",
+		HTMLURL: fixture.pullURL(),
+	}
+	fixture.pull.Head.SHA = "sha-head-close-guard"
+	fixture.pull.Base.SHA = "sha-base-close-guard"
+	fixture.pull.User.Login = "author-login"
+
+	collab := proposeCollabForTest(t, srv, author, map[string]any{
+		"title":   "Upgrade PR legacy reward guard",
+		"goal":    "Ensure collab.close reward no longer applies",
+		"kind":    "upgrade_pr",
+		"pr_repo": "agi-bar/clawcolony",
+		"pr_url":  fixture.pullURL(),
+	})
+	w := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/close", map[string]any{
+		"collab_id":              collab.CollabID,
+		"result":                 "closed",
+		"status_or_summary_note": "manual close",
+	}, author.headers())
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("upgrade_pr close status=%d body=%s", w.Code, w.Body.String())
+	}
+	if got := tokenBalanceForUser(t, srv, author.id); got != 1000 {
+		t.Fatalf("upgrade_pr close should not mint legacy collab reward, got balance=%d body=%s", got, w.Body.String())
+	}
+}
+
+func TestUpgradePRMergedAutoRewardsAuthorAndReviewers(t *testing.T) {
+	srv := newTestServer()
+	ctx := context.Background()
+	author := newAuthUser(t, srv)
+	reviewerOne := newAuthUser(t, srv)
+	reviewerTwo := newAuthUser(t, srv)
+	fixture := newFakeUpgradePRGitHub(t, "agi-bar/clawcolony", 91)
+	fixture.pull = githubPullRequestRecord{
+		Number:  91,
+		State:   "open",
+		HTMLURL: fixture.pullURL(),
+	}
+	fixture.pull.Head.SHA = "sha-head-merged"
+	fixture.pull.Base.SHA = "sha-base-merged"
+	fixture.pull.User.Login = "author-login"
+
+	collab := setupUpgradePRRewardFlowForTest(t, srv, fixture, author, reviewerOne, reviewerTwo)
+	fixture.reviews = []githubPullReviewRecord{
+		makeUpgradePRReview(1, "reviewer-one", "APPROVED", collab.CollabID, fixture.pull.Head.SHA, "agree", "ship it", "none", time.Now().Add(-5*time.Minute)),
+		makeUpgradePRReview(2, "reviewer-two", "COMMENTED", collab.CollabID, fixture.pull.Head.SHA, "disagree", "one concern", "key issue", time.Now().Add(-4*time.Minute)),
+	}
+	mergedAt := time.Now().UTC()
+	fixture.pull.State = "closed"
+	fixture.pull.Merged = true
+	fixture.pull.MergeCommitSHA = "merge-commit-123"
+	fixture.pull.MergedAt = &mergedAt
+
+	session, err := srv.store.GetCollabSession(ctx, collab.CollabID)
+	if err != nil {
+		t.Fatalf("reload collab before sync: %v", err)
+	}
+	if err := srv.syncUpgradePRState(ctx, session); err != nil {
+		t.Fatalf("sync merged upgrade_pr: %v", err)
+	}
+
+	after, err := srv.store.GetCollabSession(ctx, collab.CollabID)
+	if err != nil {
+		t.Fatalf("reload collab after sync: %v", err)
+	}
+	if after.Phase != "closed" || after.GitHubPRState != "merged" {
+		t.Fatalf("merged upgrade_pr should auto-close, got=%+v", after)
+	}
+	if got := tokenBalanceForUser(t, srv, author.id); got != 1000+communityRewardAmountUpgradePRAuthor {
+		t.Fatalf("author merged reward mismatch balance=%d", got)
+	}
+	if got := tokenBalanceForUser(t, srv, reviewerOne.id); got != 1000+communityRewardAmountUpgradePRReviewer {
+		t.Fatalf("reviewer one reward mismatch balance=%d", got)
+	}
+	if got := tokenBalanceForUser(t, srv, reviewerTwo.id); got != 1000+communityRewardAmountUpgradePRReviewer {
+		t.Fatalf("reviewer two should be rewarded for valid disagree review balance=%d", got)
+	}
+}
+
+func TestUpgradePRClosedWithoutMergeRewardsReviewersOnly(t *testing.T) {
+	srv := newTestServer()
+	ctx := context.Background()
+	author := newAuthUser(t, srv)
+	reviewerOne := newAuthUser(t, srv)
+	reviewerTwo := newAuthUser(t, srv)
+	fixture := newFakeUpgradePRGitHub(t, "agi-bar/clawcolony", 92)
+	fixture.pull = githubPullRequestRecord{
+		Number:  92,
+		State:   "open",
+		HTMLURL: fixture.pullURL(),
+	}
+	fixture.pull.Head.SHA = "sha-head-closed"
+	fixture.pull.Base.SHA = "sha-base-closed"
+	fixture.pull.User.Login = "author-login"
+
+	collab := setupUpgradePRRewardFlowForTest(t, srv, fixture, author, reviewerOne, reviewerTwo)
+	fixture.reviews = []githubPullReviewRecord{
+		makeUpgradePRReview(1, "reviewer-one", "APPROVED", collab.CollabID, fixture.pull.Head.SHA, "agree", "ready before close", "none", time.Now().Add(-5*time.Minute)),
+		makeUpgradePRReview(2, "reviewer-two", "CHANGES_REQUESTED", collab.CollabID, fixture.pull.Head.SHA, "disagree", "blocking issue", "key issue", time.Now().Add(-4*time.Minute)),
+	}
+	fixture.pull.State = "closed"
+	fixture.pull.Merged = false
+	fixture.pull.MergeCommitSHA = ""
+	fixture.pull.MergedAt = nil
+
+	session, err := srv.store.GetCollabSession(ctx, collab.CollabID)
+	if err != nil {
+		t.Fatalf("reload collab before sync: %v", err)
+	}
+	if err := srv.syncUpgradePRState(ctx, session); err != nil {
+		t.Fatalf("sync closed upgrade_pr: %v", err)
+	}
+
+	after, err := srv.store.GetCollabSession(ctx, collab.CollabID)
+	if err != nil {
+		t.Fatalf("reload collab after sync: %v", err)
+	}
+	if after.Phase != "failed" || after.GitHubPRState != "closed" {
+		t.Fatalf("closed unmerged upgrade_pr should fail, got=%+v", after)
+	}
+	if got := tokenBalanceForUser(t, srv, author.id); got != 1000 {
+		t.Fatalf("author should not receive merge reward on failed PR, balance=%d", got)
+	}
+	if got := tokenBalanceForUser(t, srv, reviewerOne.id); got != 1000+communityRewardAmountUpgradePRReviewer {
+		t.Fatalf("reviewer one failed-terminal reward mismatch balance=%d", got)
+	}
+	if got := tokenBalanceForUser(t, srv, reviewerTwo.id); got != 1000+communityRewardAmountUpgradePRReviewer {
+		t.Fatalf("reviewer two failed-terminal reward mismatch balance=%d", got)
+	}
+}
+
+func TestUpgradePRClaimReturnsFallbackRewardForEligibleUser(t *testing.T) {
+	srv := newTestServer()
+	author := newAuthUser(t, srv)
+	reviewerOne := newAuthUser(t, srv)
+	reviewerTwo := newAuthUser(t, srv)
+	outsider := newAuthUser(t, srv)
+	fixture := newFakeUpgradePRGitHub(t, "agi-bar/clawcolony", 93)
+	fixture.pull = githubPullRequestRecord{
+		Number:  93,
+		State:   "open",
+		HTMLURL: fixture.pullURL(),
+	}
+	fixture.pull.Head.SHA = "sha-head-claim"
+	fixture.pull.Base.SHA = "sha-base-claim"
+	fixture.pull.User.Login = "author-login"
+
+	collab := setupUpgradePRRewardFlowForTest(t, srv, fixture, author, reviewerOne, reviewerTwo)
+	fixture.reviews = []githubPullReviewRecord{
+		makeUpgradePRReview(1, "reviewer-one", "APPROVED", collab.CollabID, fixture.pull.Head.SHA, "agree", "ready", "none", time.Now().Add(-5*time.Minute)),
+		makeUpgradePRReview(2, "reviewer-two", "COMMENTED", collab.CollabID, fixture.pull.Head.SHA, "disagree", "one objection", "key issue", time.Now().Add(-4*time.Minute)),
+	}
+	mergedAt := time.Now().UTC()
+	fixture.pull.State = "closed"
+	fixture.pull.Merged = true
+	fixture.pull.MergeCommitSHA = "merge-claim-123"
+	fixture.pull.MergedAt = &mergedAt
+
+	authorClaim := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/token/reward/upgrade-pr-claim", map[string]any{
+		"collab_id":        collab.CollabID,
+		"pr_url":           fixture.pullURL(),
+		"merge_commit_sha": "merge-claim-123",
+	}, author.headers())
+	if authorClaim.Code != http.StatusAccepted {
+		t.Fatalf("author claim status=%d body=%s", authorClaim.Code, authorClaim.Body.String())
+	}
+	if got := tokenBalanceForUser(t, srv, author.id); got != 1000+communityRewardAmountUpgradePRAuthor {
+		t.Fatalf("author fallback claim balance mismatch=%d body=%s", got, authorClaim.Body.String())
+	}
+
+	reviewerClaim := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/token/reward/upgrade-pr-claim", map[string]any{
+		"collab_id": collab.CollabID,
+	}, reviewerTwo.headers())
+	if reviewerClaim.Code != http.StatusAccepted {
+		t.Fatalf("reviewer claim status=%d body=%s", reviewerClaim.Code, reviewerClaim.Body.String())
+	}
+	if got := tokenBalanceForUser(t, srv, reviewerTwo.id); got != 1000+communityRewardAmountUpgradePRReviewer {
+		t.Fatalf("reviewer fallback claim balance mismatch=%d body=%s", got, reviewerClaim.Body.String())
+	}
+
+	noClaim := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/token/reward/upgrade-pr-claim", map[string]any{
+		"collab_id": collab.CollabID,
+	}, outsider.headers())
+	if noClaim.Code != http.StatusConflict || !strings.Contains(noClaim.Body.String(), "no claimable reward") {
+		t.Fatalf("non-participant claim should fail, got=%d body=%s", noClaim.Code, noClaim.Body.String())
 	}
 }
 

@@ -541,6 +541,7 @@ func (s *Server) runWorldTickWithTrigger(ctx context.Context, triggerType string
 		appendSkipped("agent_action_window", "world_frozen")
 		appendSkipped("collect_outbox", "world_frozen")
 		appendSkipped("repo_sync", "world_frozen")
+		appendSkipped("upgrade_pr_tick", "world_frozen")
 		appendSkipped("kb_tick", "world_frozen")
 		appendSkipped("ganglia_metabolism", "world_frozen")
 		appendSkipped("npc_tick", "world_frozen")
@@ -586,6 +587,7 @@ func (s *Server) runWorldTickWithTrigger(ctx context.Context, triggerType string
 			appendSkipped("agent_action_window", "world_frozen")
 			appendSkipped("collect_outbox", "world_frozen")
 			appendSkipped("repo_sync", "world_frozen")
+			appendSkipped("upgrade_pr_tick", "world_frozen")
 			appendSkipped("kb_tick", "world_frozen")
 			appendSkipped("ganglia_metabolism", "world_frozen")
 			appendSkipped("npc_tick", "world_frozen")
@@ -615,6 +617,9 @@ func (s *Server) runWorldTickWithTrigger(ctx context.Context, triggerType string
 			})
 			runStep("repo_sync", func() error {
 				return s.runRepoSyncTick(ctx, tickID)
+			})
+			runStep("upgrade_pr_tick", func() error {
+				return s.runUpgradePRTick(ctx, tickID)
 			})
 			runStep("kb_tick", func() error {
 				return nil
@@ -836,6 +841,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/token/history", s.handleTokenHistory)
 	s.mux.HandleFunc("/api/v1/token/task-market", s.handleTokenTaskMarket)
 	s.mux.HandleFunc("/api/v1/token/reward/upgrade-closure", s.handleTokenUpgradeClosureReward)
+	s.mux.HandleFunc("/api/v1/token/reward/upgrade-pr-claim", s.handleTokenUpgradePRClaim)
 	s.mux.HandleFunc("/api/v1/mail/send", s.handleMailSend)
 	s.mux.HandleFunc("/api/v1/mail/send-list", s.handleMailSendList)
 	s.mux.HandleFunc("/api/v1/mail/inbox", s.handleMailInbox)
@@ -3262,9 +3268,16 @@ func (s *Server) handleTokenBalance(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	userID, ok := s.requireAPIKeyUserID(w, r)
-	if !ok {
-		return
+	// Explicit user_id balance lookups are intentionally public for dashboard/frontend reads.
+	// When user_id is omitted, fall back to the authenticated current-agent identity.
+	userID := queryUserID(r)
+	if userID == "" {
+		authUserID, err := s.authenticatedUserIDOrAPIKey(r)
+		if err != nil {
+			writeAPIKeyAuthError(w, err)
+			return
+		}
+		userID = authUserID
 	}
 	if isSystemTokenUserID(userID) {
 		writeError(w, http.StatusNotFound, "user token account not found")
@@ -3604,6 +3617,8 @@ type collabProposeRequest struct {
 	MinMembers int    `json:"min_members"`
 	MaxMembers int    `json:"max_members"`
 	PRRepo     string `json:"pr_repo"`
+	PRBranch   string `json:"pr_branch"`
+	PRURL      string `json:"pr_url"`
 }
 
 type collabUpdatePRRequest struct {
@@ -3615,8 +3630,10 @@ type collabUpdatePRRequest struct {
 }
 
 type collabApplyRequest struct {
-	CollabID string `json:"collab_id"`
-	Pitch    string `json:"pitch"`
+	CollabID        string `json:"collab_id"`
+	Pitch           string `json:"pitch"`
+	ApplicationKind string `json:"application_kind"`
+	EvidenceURL     string `json:"evidence_url"`
 }
 
 type collabAssignment struct {
@@ -3655,6 +3672,12 @@ type collabCloseRequest struct {
 	CollabID            string `json:"collab_id"`
 	Result              string `json:"result"`
 	StatusOrSummaryNote string `json:"status_or_summary_note"`
+}
+
+type tokenUpgradePRClaimRequest struct {
+	CollabID       string `json:"collab_id"`
+	PRURL          string `json:"pr_url"`
+	MergeCommitSHA string `json:"merge_commit_sha"`
 }
 
 type kbProposalChangePayload struct {
@@ -4460,6 +4483,9 @@ func normalizeCollabPhase(v string) string {
 }
 
 func collabActionOwnerUserID(session store.CollabSession) string {
+	if session.Kind == "upgrade_pr" {
+		return upgradePRAuthorUserID(session)
+	}
 	if uid := strings.TrimSpace(session.OrchestratorUserID); uid != "" {
 		return uid
 	}
@@ -4525,6 +4551,8 @@ func (s *Server) handleCollabPropose(w http.ResponseWriter, r *http.Request) {
 		req.Complexity = "normal"
 	}
 	req.PRRepo = strings.TrimSpace(req.PRRepo)
+	req.PRBranch = strings.TrimSpace(req.PRBranch)
+	req.PRURL = strings.TrimSpace(req.PRURL)
 	if req.Title == "" || req.Goal == "" {
 		writeError(w, http.StatusBadRequest, "title and goal are required")
 		return
@@ -4533,15 +4561,52 @@ func (s *Server) handleCollabPropose(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "pr_repo is required for kind=upgrade_pr")
 		return
 	}
-	if req.MinMembers <= 0 {
-		req.MinMembers = 2
+	if req.Kind == "upgrade_pr" && req.PRURL == "" {
+		writeError(w, http.StatusBadRequest, "pr_url is required for kind=upgrade_pr")
+		return
 	}
-	if req.MaxMembers <= 0 {
-		req.MaxMembers = 3
+	if req.Kind == "upgrade_pr" {
+		req.MinMembers = 1
+		req.MaxMembers = 1
+	} else {
+		if req.MinMembers <= 0 {
+			req.MinMembers = 2
+		}
+		if req.MaxMembers <= 0 {
+			req.MaxMembers = 3
+		}
 	}
 	if req.MaxMembers < req.MinMembers {
 		writeError(w, http.StatusBadRequest, "max_members must be >= min_members")
 		return
+	}
+	phase := "recruiting"
+	var pull githubPullRequestRecord
+	var reviewDeadline *time.Time
+	if req.Kind == "upgrade_pr" {
+		ref, err := parseGitHubPRRef(req.PRURL)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if !strings.EqualFold(ref.Repo, req.PRRepo) {
+			writeError(w, http.StatusBadRequest, "pr_url repo must match collab pr_repo")
+			return
+		}
+		pull, err = s.fetchGitHubPullRequest(r.Context(), ref)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		if pull.Merged || !strings.EqualFold(strings.TrimSpace(pull.State), "open") {
+			writeError(w, http.StatusBadRequest, "upgrade_pr requires an open GitHub pull request")
+			return
+		}
+		phase = "reviewing"
+		reviewDeadline = timePtr(time.Now().UTC().Add(upgradePRDefaultReviewWindow))
+		if req.PRBranch == "" {
+			req.PRBranch = strings.TrimSpace(pull.Head.Ref)
+		}
 	}
 	item, err := s.store.CreateCollabSession(r.Context(), store.CollabSession{
 		CollabID:       generateCollabID(),
@@ -4549,11 +4614,31 @@ func (s *Server) handleCollabPropose(w http.ResponseWriter, r *http.Request) {
 		Goal:           req.Goal,
 		Kind:           req.Kind,
 		Complexity:     req.Complexity,
-		Phase:          "recruiting",
+		Phase:          phase,
 		ProposerUserID: proposerUserID,
+		AuthorUserID:   proposerUserID,
 		MinMembers:     req.MinMembers,
 		MaxMembers:     req.MaxMembers,
-		PRRepo:         req.PRRepo,
+		RequiredReviewers: func() int {
+			if req.Kind == "upgrade_pr" {
+				return 2
+			}
+			return 0
+		}(),
+		PRRepo:        req.PRRepo,
+		PRBranch:      req.PRBranch,
+		PRURL:         req.PRURL,
+		PRNumber:      pull.Number,
+		PRBaseSHA:     strings.TrimSpace(pull.Base.SHA),
+		PRHeadSHA:     strings.TrimSpace(pull.Head.SHA),
+		PRAuthorLogin: strings.TrimSpace(pull.User.Login),
+		GitHubPRState: func() string {
+			if req.Kind == "upgrade_pr" {
+				return "open"
+			}
+			return ""
+		}(),
+		ReviewDeadlineAt: reviewDeadline,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -4562,15 +4647,30 @@ func (s *Server) handleCollabPropose(w http.ResponseWriter, r *http.Request) {
 	_, _ = s.store.UpsertCollabParticipant(r.Context(), store.CollabParticipant{
 		CollabID: item.CollabID,
 		UserID:   proposerUserID,
-		Role:     "orchestrator",
-		Status:   "selected",
+		Role: func() string {
+			if item.Kind == "upgrade_pr" {
+				return "author"
+			}
+			return "orchestrator"
+		}(),
+		Status: "selected",
 	})
 	s.appendCollabEvent(r.Context(), item.CollabID, proposerUserID, "proposal.created", map[string]any{
 		"title":      item.Title,
 		"goal":       item.Goal,
 		"complexity": item.Complexity,
 	})
-	s.notifyCollabProposalPinned(r.Context(), item)
+	if item.Kind == "upgrade_pr" {
+		s.appendCollabEvent(r.Context(), item.CollabID, proposerUserID, "pr.updated", map[string]any{
+			"pr_url":      item.PRURL,
+			"pr_branch":   item.PRBranch,
+			"pr_head_sha": item.PRHeadSHA,
+			"pr_base_sha": item.PRBaseSHA,
+		})
+		s.notifyUpgradePRReviewOpen(r.Context(), item)
+	} else {
+		s.notifyCollabProposalPinned(r.Context(), item)
+	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"item": item})
 }
 
@@ -4679,6 +4779,8 @@ func (s *Server) handleCollabApply(w http.ResponseWriter, r *http.Request) {
 	}
 	req.CollabID = strings.TrimSpace(req.CollabID)
 	req.Pitch = strings.TrimSpace(req.Pitch)
+	req.ApplicationKind = strings.TrimSpace(strings.ToLower(req.ApplicationKind))
+	req.EvidenceURL = strings.TrimSpace(req.EvidenceURL)
 	if req.CollabID == "" {
 		writeError(w, http.StatusBadRequest, "collab_id is required")
 		return
@@ -4688,28 +4790,72 @@ func (s *Server) handleCollabApply(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
-	if session.Phase != "recruiting" {
-		writeError(w, http.StatusConflict, "collab is not in recruiting phase")
-		return
+	var item store.CollabParticipant
+	if session.Kind == "upgrade_pr" {
+		if session.Phase == "closed" || session.Phase == "failed" {
+			writeError(w, http.StatusConflict, "collab is already closed")
+			return
+		}
+		if req.ApplicationKind == "" {
+			req.ApplicationKind = "discussion"
+		}
+		switch req.ApplicationKind {
+		case "review":
+			item, err = s.validateUpgradePRReviewApplication(r.Context(), session, userID, req.EvidenceURL)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			if item.Pitch == "" {
+				item.Pitch = req.Pitch
+			}
+		case "discussion":
+			item = store.CollabParticipant{
+				CollabID:        req.CollabID,
+				UserID:          userID,
+				Role:            "discussion",
+				Status:          "applied",
+				Pitch:           req.Pitch,
+				ApplicationKind: "discussion",
+				EvidenceURL:     req.EvidenceURL,
+			}
+		default:
+			writeError(w, http.StatusBadRequest, "application_kind must be review or discussion")
+			return
+		}
+	} else {
+		if session.Phase != "recruiting" {
+			writeError(w, http.StatusConflict, "collab is not in recruiting phase")
+			return
+		}
+		item = store.CollabParticipant{
+			CollabID: req.CollabID,
+			UserID:   userID,
+			Status:   "applied",
+			Pitch:    req.Pitch,
+		}
 	}
-	item, err := s.store.UpsertCollabParticipant(r.Context(), store.CollabParticipant{
-		CollabID: req.CollabID,
-		UserID:   userID,
-		Status:   "applied",
-		Pitch:    req.Pitch,
-	})
+	item, err = s.store.UpsertCollabParticipant(r.Context(), item)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.appendCollabEvent(r.Context(), req.CollabID, userID, "participant.applied", map[string]any{"pitch": req.Pitch})
+	s.appendCollabEvent(r.Context(), req.CollabID, userID, "participant.applied", map[string]any{
+		"pitch":            item.Pitch,
+		"application_kind": item.ApplicationKind,
+		"evidence_url":     item.EvidenceURL,
+		"verified":         item.Verified,
+	})
 	s.notifyCollabApply(r.Context(), session, userID)
 	writeJSON(w, http.StatusAccepted, map[string]any{"item": item})
 }
 
 func (s *Server) notifyCollabApply(ctx context.Context, session store.CollabSession, applicantUserID string) {
-	proposer := strings.TrimSpace(session.ProposerUserID)
-	if proposer == "" || isSystemRuntimeUserID(proposer) {
+	owner := collabActionOwnerUserID(session)
+	if session.Kind == "upgrade_pr" {
+		owner = upgradePRAuthorUserID(session)
+	}
+	if owner == "" || isSystemRuntimeUserID(owner) {
 		return
 	}
 	participants, err := s.store.ListCollabParticipants(ctx, session.CollabID, "", 500)
@@ -4717,21 +4863,39 @@ func (s *Server) notifyCollabApply(ctx context.Context, session store.CollabSess
 		return
 	}
 	appliedCount := 0
+	reviewCount := 0
 	for _, p := range participants {
 		if strings.EqualFold(p.Status, "applied") || strings.EqualFold(p.Status, "selected") {
 			appliedCount++
 		}
+		if session.Kind == "upgrade_pr" && strings.EqualFold(p.ApplicationKind, "review") && p.Verified {
+			reviewCount++
+		}
 	}
 	readyNote := ""
-	if appliedCount >= session.MinMembers {
+	if session.Kind == "upgrade_pr" {
+		required := session.RequiredReviewers
+		if required <= 0 {
+			required = 2
+		}
+		if reviewCount >= required {
+			readyNote = fmt.Sprintf("\n\nVerified review applicants (%d) meet required_reviewers (%d). Review can proceed on the current head_sha.", reviewCount, required)
+		}
+	} else if appliedCount >= session.MinMembers {
 		readyNote = fmt.Sprintf("\n\nApplicant count (%d) meets min_members (%d). You can now assign roles via POST /api/v1/collab/assign.", appliedCount, session.MinMembers)
 	}
 	subject := fmt.Sprintf("[COLLAB-APPLY] %s applied to %s (%d applicants)", applicantUserID, session.CollabID, appliedCount)
-	body := fmt.Sprintf(
-		"collab_id=%s\napplicant=%s\npitch=%s\napplied_count=%d\nmin_members=%d%s",
-		session.CollabID, applicantUserID, "", appliedCount, session.MinMembers, readyNote,
-	)
-	s.sendMailAndPushHint(ctx, clawWorldSystemID, []string{proposer}, subject, body)
+	body := fmt.Sprintf("collab_id=%s\napplicant=%s\napplied_count=%d", session.CollabID, applicantUserID, appliedCount)
+	if session.Kind == "upgrade_pr" {
+		required := session.RequiredReviewers
+		if required <= 0 {
+			required = 2
+		}
+		body = fmt.Sprintf("%s\nverified_review_applicants=%d\nrequired_reviewers=%d%s", body, reviewCount, required, readyNote)
+	} else {
+		body = fmt.Sprintf("%s\nmin_members=%d%s", body, session.MinMembers, readyNote)
+	}
+	s.sendMailAndPushHint(ctx, clawWorldSystemID, []string{owner}, subject, body)
 }
 
 func (s *Server) handleCollabAssign(w http.ResponseWriter, r *http.Request) {
@@ -4761,6 +4925,10 @@ func (s *Server) handleCollabAssign(w http.ResponseWriter, r *http.Request) {
 	session, err := s.store.GetCollabSession(r.Context(), req.CollabID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if session.Kind == "upgrade_pr" {
+		writeError(w, http.StatusConflict, "upgrade_pr uses author-led flow; assign is not used")
 		return
 	}
 	if session.Phase != "recruiting" {
@@ -4838,6 +5006,10 @@ func (s *Server) handleCollabStart(w http.ResponseWriter, r *http.Request) {
 	session, err := s.store.GetCollabSession(r.Context(), req.CollabID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if session.Kind == "upgrade_pr" {
+		writeError(w, http.StatusConflict, "upgrade_pr starts immediately after propose; start is not used")
 		return
 	}
 	if !canTransitCollabPhase(session.Phase, "executing") {
@@ -5003,32 +5175,21 @@ func (s *Server) handleCollabClose(w http.ResponseWriter, r *http.Request) {
 	}
 	ownerUserID := collabActionOwnerUserID(session)
 	if ownerUserID != "" && orchestratorUserID != ownerUserID {
-		writeError(w, http.StatusForbidden, "only current orchestrator can close collab")
+		writeError(w, http.StatusForbidden, "only current collab owner can close collab")
 		return
 	}
 	if !canTransitCollabPhase(session.Phase, target) {
 		writeError(w, http.StatusConflict, "phase transition not allowed")
 		return
 	}
-	now := time.Now().UTC()
-	item, err := s.store.UpdateCollabPhase(r.Context(), req.CollabID, target, ownerUserID, req.StatusOrSummaryNote, &now)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	item, rewards, closeErr := s.closeCollabInternal(r.Context(), session, req.Result, req.StatusOrSummaryNote, orchestratorUserID)
+	if closeErr != nil {
+		writeError(w, http.StatusInternalServerError, closeErr.Error())
 		return
 	}
-	s.appendCollabEvent(r.Context(), req.CollabID, orchestratorUserID, "collab.closed", map[string]any{
-		"result": req.Result,
-		"note":   req.StatusOrSummaryNote,
-	})
 	resp := map[string]any{"item": item}
-	if target == "closed" {
-		rewards, rewardErr := s.rewardCollabClosed(r.Context(), item)
-		if len(rewards) > 0 {
-			resp["community_rewards"] = rewards
-		}
-		if rewardErr != nil {
-			resp["community_reward_error"] = rewardErr.Error()
-		}
+	if len(rewards) > 0 {
+		resp["community_rewards"] = rewards
 	}
 	writeJSON(w, http.StatusAccepted, resp)
 }
@@ -5121,26 +5282,80 @@ func (s *Server) handleCollabUpdatePR(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "update-pr is only valid for kind=upgrade_pr collabs")
 		return
 	}
-	allowed := userID == session.ProposerUserID || userID == session.OrchestratorUserID
+	allowed := userID == session.ProposerUserID || userID == session.OrchestratorUserID || userID == upgradePRAuthorUserID(session)
 	if !allowed {
 		participants, _ := s.store.ListCollabParticipants(r.Context(), req.CollabID, "selected", 500)
 		for _, p := range participants {
-			if p.UserID == userID && (p.Role == "author" || p.Role == "orchestrator") {
+			if p.UserID == userID && p.Role == "author" {
 				allowed = true
 				break
 			}
 		}
 	}
 	if !allowed {
-		writeError(w, http.StatusForbidden, "only proposer, orchestrator, or author can update PR metadata")
+		writeError(w, http.StatusForbidden, "only proposer or author can update PR metadata")
 		return
 	}
-	updated, err := s.store.UpdateCollabPR(r.Context(), req.CollabID,
-		strings.TrimSpace(req.PRBranch), strings.TrimSpace(req.PRURL),
-		strings.TrimSpace(req.PRBaseSHA), strings.TrimSpace(req.PRHeadSHA))
+	effectivePRURL := strings.TrimSpace(req.PRURL)
+	if effectivePRURL == "" {
+		effectivePRURL = session.PRURL
+	}
+	if session.PRURL != "" && req.PRURL != "" && !strings.EqualFold(strings.TrimSpace(req.PRURL), session.PRURL) {
+		writeError(w, http.StatusConflict, "upgrade_pr collab is already bound to a pull request")
+		return
+	}
+	ref, err := parseGitHubPRRef(effectivePRURL)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !strings.EqualFold(ref.Repo, session.PRRepo) {
+		writeError(w, http.StatusBadRequest, "pr_url repo must match collab pr_repo")
+		return
+	}
+	pull, err := s.fetchGitHubPullRequest(r.Context(), ref)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	firstRegistration := strings.TrimSpace(session.PRURL) == "" || session.ReviewDeadlineAt == nil
+	reviewDeadline := session.ReviewDeadlineAt
+	if reviewDeadline == nil {
+		reviewDeadline = timePtr(time.Now().UTC().Add(upgradePRDefaultReviewWindow))
+	}
+	effectivePRBranch := strings.TrimSpace(req.PRBranch)
+	if effectivePRBranch == "" {
+		effectivePRBranch = strings.TrimSpace(session.PRBranch)
+	}
+	if effectivePRBranch == "" {
+		effectivePRBranch = strings.TrimSpace(pull.Head.Ref)
+	}
+	updated, err := s.store.UpdateCollabPR(r.Context(), store.CollabPRUpdate{
+		CollabID:      req.CollabID,
+		PRBranch:      effectivePRBranch,
+		PRURL:         effectivePRURL,
+		PRNumber:      pull.Number,
+		PRBaseSHA:     strings.TrimSpace(pull.Base.SHA),
+		PRHeadSHA:     strings.TrimSpace(pull.Head.SHA),
+		PRAuthorLogin: strings.TrimSpace(pull.User.Login),
+		GitHubPRState: func() string {
+			if pull.Merged {
+				return "merged"
+			}
+			return strings.ToLower(strings.TrimSpace(pull.State))
+		}(),
+		PRMergeCommitSHA: strings.TrimSpace(pull.MergeCommitSHA),
+		ReviewDeadlineAt: reviewDeadline,
+		PRMergedAt:       pull.MergedAt,
+	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if updated.Phase == "executing" && strings.EqualFold(updated.GitHubPRState, "open") {
+		if phaseItem, phaseErr := s.store.UpdateCollabPhase(r.Context(), updated.CollabID, "reviewing", updated.OrchestratorUserID, "pull request opened and waiting for review", nil); phaseErr == nil {
+			updated = phaseItem
+		}
 	}
 	s.appendCollabEvent(r.Context(), req.CollabID, userID, "pr.updated", map[string]any{
 		"pr_url":      updated.PRURL,
@@ -5148,6 +5363,11 @@ func (s *Server) handleCollabUpdatePR(w http.ResponseWriter, r *http.Request) {
 		"pr_head_sha": updated.PRHeadSHA,
 		"pr_base_sha": updated.PRBaseSHA,
 	})
+	if firstRegistration {
+		s.notifyUpgradePRReviewOpen(r.Context(), updated)
+	} else if session.PRHeadSHA != "" && !strings.EqualFold(session.PRHeadSHA, updated.PRHeadSHA) {
+		s.notifyUpgradePRHeadChanged(r.Context(), updated, session.PRHeadSHA, updated.PRHeadSHA)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"item": updated})
 }
 
@@ -5170,44 +5390,55 @@ func (s *Server) handleCollabMergeGate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "merge-gate is only valid for kind=upgrade_pr collabs")
 		return
 	}
-	artifacts, err := s.store.ListCollabArtifacts(r.Context(), collabID, "", 500)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	if strings.TrimSpace(session.PRURL) == "" {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"collab_id":               session.CollabID,
+			"pr_url":                  session.PRURL,
+			"pr_head_sha":             session.PRHeadSHA,
+			"valid_reviewers_at_head": 0,
+			"approvals_at_head":       0,
+			"disagreements_at_head":   0,
+			"review_complete":         false,
+			"mergeable":               false,
+			"review_deadline_at":      session.ReviewDeadlineAt,
+			"blockers":                []string{"pr_url is not registered"},
+		})
 		return
 	}
-	approvals := 0
-	approvalsAtHead := 0
-	staleVerdicts := 0
-	for _, a := range artifacts {
-		if !strings.EqualFold(a.Kind, "review_verdict") {
-			continue
-		}
-		if !strings.Contains(strings.ToLower(a.Summary), "approve") && !strings.Contains(strings.ToLower(a.Content), "verdict=approve") {
-			continue
-		}
-		approvals++
-		if session.PRHeadSHA != "" && strings.Contains(a.Content, session.PRHeadSHA) {
-			approvalsAtHead++
-		} else {
-			staleVerdicts++
-		}
+	ref, err := parseGitHubPRRef(session.PRURL)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
-	blockers := make([]string, 0)
-	if approvalsAtHead < 2 {
-		blockers = append(blockers, fmt.Sprintf("need 2 approvals at current head_sha, have %d", approvalsAtHead))
+	pull, err := s.fetchGitHubPullRequest(r.Context(), ref)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
 	}
-	mergeable := approvalsAtHead >= 2
-
+	session.PRHeadSHA = strings.TrimSpace(pull.Head.SHA)
+	session.GitHubPRState = func() string {
+		if pull.Merged {
+			return "merged"
+		}
+		return strings.ToLower(strings.TrimSpace(pull.State))
+	}()
+	status, err := s.evaluateUpgradePRReviews(r.Context(), session, session.PRHeadSHA)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"collab_id":         session.CollabID,
-		"pr_url":            session.PRURL,
-		"pr_head_sha":       session.PRHeadSHA,
-		"approvals":         approvals,
-		"approvals_at_head": approvalsAtHead,
-		"stale_verdicts":    staleVerdicts,
-		"tests_passed":      "unknown",
-		"mergeable":         mergeable,
-		"blockers":          blockers,
+		"collab_id":               session.CollabID,
+		"pr_url":                  session.PRURL,
+		"pr_head_sha":             session.PRHeadSHA,
+		"valid_reviewers_at_head": status.ValidReviewersAtHead,
+		"approvals_at_head":       status.ApprovalsAtHead,
+		"disagreements_at_head":   status.DisagreementsAtHead,
+		"review_complete":         status.ReviewComplete,
+		"review_deadline_at":      session.ReviewDeadlineAt,
+		"tests_passed":            "unknown",
+		"mergeable":               status.Mergeable,
+		"blockers":                status.Blockers,
 	})
 }
 
@@ -6922,6 +7153,7 @@ func (s *Server) apiCatalog() []string {
 		"GET /api/v1/token/history?user_id=<id>",
 		"GET /api/v1/token/task-market?user_id=<id>&source=manual|system|all&module=bounty|kb|collab&status=<status>&limit=<n>",
 		"POST /api/v1/token/reward/upgrade-closure (internal only)",
+		"POST /api/v1/token/reward/upgrade-pr-claim",
 		"POST /api/v1/mail/send",
 		"POST /api/v1/mail/send-list",
 		"GET /api/v1/mail/inbox?user_id=<id>&scope=all|read|unread&keyword=<kw>&limit=<n>",
@@ -7597,7 +7829,8 @@ func isSharedWritePath(method, path string) bool {
 	case "/api/v1/token/transfer",
 		"/api/v1/token/tip",
 		"/api/v1/token/wish/create",
-		"/api/v1/token/wish/fulfill":
+		"/api/v1/token/wish/fulfill",
+		"/api/v1/token/reward/upgrade-pr-claim":
 		return true
 
 	default:

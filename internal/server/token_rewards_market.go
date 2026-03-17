@@ -19,17 +19,21 @@ const (
 	tokenTaskMarketSourceManual = "manual"
 	tokenTaskMarketSourceSystem = "system"
 
-	communityRewardRuleKBApply                 = "kb.apply"
-	communityRewardRuleCollabClose             = "collab.close"
-	communityRewardRuleBountyPaid              = "bounty.paid"
-	communityRewardRuleGangliaIntegrate        = "ganglia.integrate"
-	communityRewardRuleUpgradeClawcolony       = "upgrade-clawcolony"
-	communityRewardRuleSelfCoreUpgrade         = "self-core-upgrade"
-	communityRewardAmountBountyPaid      int64 = 5000
-	communityRewardAmountGanglia               = 5000
-	communityRewardAmountKBApply               = 5000
-	communityRewardAmountCollabClose           = 5000
-	communityRewardAmountUpgradeClosure        = 20000
+	communityRewardRuleKBApply                   = "kb.apply"
+	communityRewardRuleCollabClose               = "collab.close"
+	communityRewardRuleBountyPaid                = "bounty.paid"
+	communityRewardRuleGangliaIntegrate          = "ganglia.integrate"
+	communityRewardRuleUpgradeClawcolony         = "upgrade-clawcolony"
+	communityRewardRuleUpgradePRAuthor           = "upgrade-pr.author"
+	communityRewardRuleUpgradePRReviewer         = "upgrade-pr.reviewer"
+	communityRewardRuleSelfCoreUpgrade           = "self-core-upgrade"
+	communityRewardAmountBountyPaid        int64 = 5000
+	communityRewardAmountGanglia                 = 5000
+	communityRewardAmountKBApply                 = 5000
+	communityRewardAmountCollabClose             = 5000
+	communityRewardAmountUpgradeClosure          = 20000
+	communityRewardAmountUpgradePRAuthor         = communityRewardAmountUpgradeClosure
+	communityRewardAmountUpgradePRReviewer       = 2000
 )
 
 type communityRewardGrant struct {
@@ -367,6 +371,9 @@ func (s *Server) rewardCollabClosed(ctx context.Context, session store.CollabSes
 	if strings.TrimSpace(strings.ToLower(session.Phase)) != "closed" {
 		return nil, nil
 	}
+	if strings.EqualFold(strings.TrimSpace(session.Kind), "upgrade_pr") {
+		return nil, nil
+	}
 	artifacts, err := s.store.ListCollabArtifacts(ctx, session.CollabID, "", 500)
 	if err != nil {
 		return nil, err
@@ -401,6 +408,75 @@ func (s *Server) rewardCollabClosed(ctx context.Context, session store.CollabSes
 			"orchestrator_user_id":    session.OrchestratorUserID,
 		},
 	})
+}
+
+func (s *Server) rewardUpgradePRTerminal(ctx context.Context, session store.CollabSession) ([]communityRewardResult, error) {
+	if !strings.EqualFold(strings.TrimSpace(session.Kind), "upgrade_pr") {
+		return nil, nil
+	}
+	phase := strings.ToLower(strings.TrimSpace(session.Phase))
+	if phase != "closed" && phase != "failed" {
+		return nil, nil
+	}
+	results := make([]communityRewardResult, 0)
+	authorUserID := strings.TrimSpace(upgradePRAuthorUserID(session))
+	if strings.EqualFold(strings.TrimSpace(session.GitHubPRState), "merged") && authorUserID != "" && !isExcludedTokenUserID(authorUserID) {
+		authorRewards, err := s.ensureCommunityRewards(ctx, communityRewardSpec{
+			RuleKey:      communityRewardRuleUpgradePRAuthor,
+			ResourceType: "collab.session",
+			ResourceID:   session.CollabID,
+			Recipients:   map[string]int64{authorUserID: communityRewardAmountUpgradePRAuthor},
+			Meta: map[string]any{
+				"collab_id":          session.CollabID,
+				"pr_url":             session.PRURL,
+				"pr_merge_commit":    session.PRMergeCommitSHA,
+				"github_pr_state":    session.GitHubPRState,
+				"reward_role":        "author",
+				"reward_amount":      communityRewardAmountUpgradePRAuthor,
+				"required_reviewers": session.RequiredReviewers,
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, authorRewards...)
+	}
+	if strings.TrimSpace(session.PRURL) == "" {
+		return buildCommunityRewardResults(results), nil
+	}
+	status, err := s.evaluateUpgradePRReviews(ctx, session, session.PRHeadSHA)
+	if err != nil {
+		return nil, err
+	}
+	reviewerRecipients := make(map[string]int64)
+	for _, reviewerUserID := range status.RewardEligibleReviewerIDs {
+		reviewerUserID = strings.TrimSpace(reviewerUserID)
+		if reviewerUserID == "" || reviewerUserID == authorUserID || isExcludedTokenUserID(reviewerUserID) {
+			continue
+		}
+		reviewerRecipients[reviewerUserID] = communityRewardAmountUpgradePRReviewer
+	}
+	reviewerRewards, err := s.ensureCommunityRewards(ctx, communityRewardSpec{
+		RuleKey:      communityRewardRuleUpgradePRReviewer,
+		ResourceType: "collab.session",
+		ResourceID:   session.CollabID,
+		Recipients:   reviewerRecipients,
+		Meta: map[string]any{
+			"collab_id":               session.CollabID,
+			"pr_url":                  session.PRURL,
+			"github_pr_state":         session.GitHubPRState,
+			"reward_role":             "reviewer",
+			"reward_amount":           communityRewardAmountUpgradePRReviewer,
+			"reward_eligible_users":   status.RewardEligibleReviewerIDs,
+			"review_complete":         status.ReviewComplete,
+			"valid_reviewers_at_head": status.ValidReviewersAtHead,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	results = append(results, reviewerRewards...)
+	return buildCommunityRewardResults(results), nil
 }
 
 func (s *Server) rewardBountyPaid(ctx context.Context, item bountyItem) ([]communityRewardResult, error) {
@@ -529,6 +605,114 @@ func (s *Server) handleTokenUpgradeClosureReward(w http.ResponseWriter, r *http.
 			"note":             req.Note,
 		},
 		"community_rewards": results,
+	})
+}
+
+func (s *Server) handleTokenUpgradePRClaim(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	userID, err := s.authenticatedUserIDOrAPIKey(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	var req tokenUpgradePRClaimRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.CollabID = strings.TrimSpace(req.CollabID)
+	req.PRURL = strings.TrimSpace(req.PRURL)
+	req.MergeCommitSHA = strings.TrimSpace(req.MergeCommitSHA)
+	if req.CollabID == "" {
+		writeError(w, http.StatusBadRequest, "collab_id is required")
+		return
+	}
+	session, err := s.store.GetCollabSession(r.Context(), req.CollabID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(session.Kind), "upgrade_pr") {
+		writeError(w, http.StatusBadRequest, "upgrade-pr-claim is only valid for kind=upgrade_pr collabs")
+		return
+	}
+	if req.PRURL != "" && session.PRURL != "" && !strings.EqualFold(req.PRURL, session.PRURL) {
+		writeError(w, http.StatusConflict, "pr_url does not match collab")
+		return
+	}
+	if strings.TrimSpace(session.PRURL) != "" {
+		ref, err := parseGitHubPRRef(session.PRURL)
+		if err == nil {
+			if pull, err := s.fetchGitHubPullRequest(r.Context(), ref); err == nil {
+				session, _ = s.store.UpdateCollabPR(r.Context(), store.CollabPRUpdate{
+					CollabID:      session.CollabID,
+					PRURL:         session.PRURL,
+					PRNumber:      pull.Number,
+					PRBaseSHA:     strings.TrimSpace(pull.Base.SHA),
+					PRHeadSHA:     strings.TrimSpace(pull.Head.SHA),
+					PRAuthorLogin: strings.TrimSpace(pull.User.Login),
+					GitHubPRState: func() string {
+						if pull.Merged {
+							return "merged"
+						}
+						return strings.ToLower(strings.TrimSpace(pull.State))
+					}(),
+					PRMergeCommitSHA: strings.TrimSpace(pull.MergeCommitSHA),
+					PRMergedAt:       pull.MergedAt,
+				})
+			}
+		}
+	}
+	if req.MergeCommitSHA != "" && session.PRMergeCommitSHA != "" && !strings.EqualFold(req.MergeCommitSHA, session.PRMergeCommitSHA) {
+		writeError(w, http.StatusConflict, "merge_commit_sha does not match collab")
+		return
+	}
+	switch strings.ToLower(strings.TrimSpace(session.Phase)) {
+	case "closed", "failed":
+	default:
+		switch strings.ToLower(strings.TrimSpace(session.GitHubPRState)) {
+		case "merged":
+			session, _, err = s.closeCollabInternal(r.Context(), session, "closed", "upgrade_pr merged on GitHub", clawWorldSystemID)
+		case "closed":
+			session, _, err = s.closeCollabInternal(r.Context(), session, "failed", "upgrade_pr pull request closed without merge", clawWorldSystemID)
+		default:
+			writeError(w, http.StatusConflict, "reward is not claimable until the pull request reaches a terminal state")
+			return
+		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	rewards, err := s.rewardUpgradePRTerminal(r.Context(), session)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	claimable := make([]communityRewardResult, 0, len(rewards))
+	for _, reward := range rewards {
+		if strings.EqualFold(strings.TrimSpace(reward.RecipientUserID), userID) {
+			claimable = append(claimable, reward)
+		}
+	}
+	if len(claimable) == 0 {
+		writeError(w, http.StatusConflict, "no claimable reward for this user")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"item": map[string]any{
+			"collab_id":         session.CollabID,
+			"user_id":           userID,
+			"pr_url":            session.PRURL,
+			"github_pr_state":   session.GitHubPRState,
+			"pr_merge_commit":   session.PRMergeCommitSHA,
+			"reward_claimed":    true,
+			"community_rewards": claimable,
+		},
+		"community_rewards": claimable,
 	})
 }
 
@@ -684,6 +868,9 @@ func (s *Server) collectSystemTaskMarketItems(ctx context.Context, viewerUserID,
 			return nil, err
 		}
 		for _, session := range sessions {
+			if strings.EqualFold(strings.TrimSpace(session.Kind), "upgrade_pr") {
+				continue
+			}
 			ownerUserID := collabActionOwnerUserID(session)
 			if viewerUserID != "" && ownerUserID != "" && viewerUserID != ownerUserID {
 				continue

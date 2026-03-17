@@ -108,29 +108,55 @@ type CollabSession struct {
 	Complexity          string     `json:"complexity"`
 	Phase               string     `json:"phase"`
 	ProposerUserID      string     `json:"proposer_user_id"`
+	AuthorUserID        string     `json:"author_user_id,omitempty"`
 	OrchestratorUserID  string     `json:"orchestrator_user_id"`
 	MinMembers          int        `json:"min_members"`
 	MaxMembers          int        `json:"max_members"`
+	RequiredReviewers   int        `json:"required_reviewers,omitempty"`
 	PRRepo              string     `json:"pr_repo,omitempty"`
 	PRBranch            string     `json:"pr_branch,omitempty"`
 	PRURL               string     `json:"pr_url,omitempty"`
+	PRNumber            int        `json:"pr_number,omitempty"`
 	PRBaseSHA           string     `json:"pr_base_sha,omitempty"`
 	PRHeadSHA           string     `json:"pr_head_sha,omitempty"`
+	PRAuthorLogin       string     `json:"pr_author_login,omitempty"`
+	GitHubPRState       string     `json:"github_pr_state,omitempty"`
+	PRMergeCommitSHA    string     `json:"pr_merge_commit_sha,omitempty"`
 	CreatedAt           time.Time  `json:"created_at"`
 	UpdatedAt           time.Time  `json:"updated_at"`
+	ReviewDeadlineAt    *time.Time `json:"review_deadline_at,omitempty"`
+	PRMergedAt          *time.Time `json:"pr_merged_at,omitempty"`
 	ClosedAt            *time.Time `json:"closed_at,omitempty"`
 	LastStatusOrSummary string     `json:"last_status_or_summary,omitempty"`
 }
 
 type CollabParticipant struct {
-	ID        int64     `json:"id"`
-	CollabID  string    `json:"collab_id"`
-	UserID    string    `json:"user_id"`
-	Role      string    `json:"role"`
-	Status    string    `json:"status"`
-	Pitch     string    `json:"pitch,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID              int64     `json:"id"`
+	CollabID        string    `json:"collab_id"`
+	UserID          string    `json:"user_id"`
+	Role            string    `json:"role"`
+	Status          string    `json:"status"`
+	Pitch           string    `json:"pitch,omitempty"`
+	ApplicationKind string    `json:"application_kind,omitempty"`
+	EvidenceURL     string    `json:"evidence_url,omitempty"`
+	Verified        bool      `json:"verified,omitempty"`
+	GitHubLogin     string    `json:"github_login,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
+type CollabPRUpdate struct {
+	CollabID         string
+	PRBranch         string
+	PRURL            string
+	PRNumber         int
+	PRBaseSHA        string
+	PRHeadSHA        string
+	PRAuthorLogin    string
+	GitHubPRState    string
+	PRMergeCommitSHA string
+	ReviewDeadlineAt *time.Time
+	PRMergedAt       *time.Time
 }
 
 type CollabArtifact struct {
@@ -483,7 +509,7 @@ type Store interface {
 	GetCollabSession(ctx context.Context, collabID string) (CollabSession, error)
 	ListCollabSessions(ctx context.Context, kind, phase, proposerUserID string, limit int) ([]CollabSession, error)
 	UpdateCollabPhase(ctx context.Context, collabID, phase, orchestratorUserID, statusSummary string, closedAt *time.Time) (CollabSession, error)
-	UpdateCollabPR(ctx context.Context, collabID, prBranch, prURL, prBaseSHA, prHeadSHA string) (CollabSession, error)
+	UpdateCollabPR(ctx context.Context, input CollabPRUpdate) (CollabSession, error)
 	UpsertCollabParticipant(ctx context.Context, item CollabParticipant) (CollabParticipant, error)
 	ListCollabParticipants(ctx context.Context, collabID, status string, limit int) ([]CollabParticipant, error)
 	CreateCollabArtifact(ctx context.Context, item CollabArtifact) (CollabArtifact, error)

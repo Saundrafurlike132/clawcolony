@@ -296,17 +296,25 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 			complexity TEXT NOT NULL DEFAULT 'normal',
 			phase TEXT NOT NULL,
 			proposer_user_id TEXT NOT NULL,
+			author_user_id TEXT NOT NULL DEFAULT '',
 			orchestrator_user_id TEXT NOT NULL DEFAULT '',
 			min_members INT NOT NULL DEFAULT 2,
 			max_members INT NOT NULL DEFAULT 3,
+			required_reviewers INT NOT NULL DEFAULT 2,
 			pr_repo TEXT NOT NULL DEFAULT '',
 			pr_branch TEXT NOT NULL DEFAULT '',
 			pr_url TEXT NOT NULL DEFAULT '',
+			pr_number INT NOT NULL DEFAULT 0,
 			pr_base_sha TEXT NOT NULL DEFAULT '',
 			pr_head_sha TEXT NOT NULL DEFAULT '',
+			pr_author_login TEXT NOT NULL DEFAULT '',
+			github_pr_state TEXT NOT NULL DEFAULT '',
+			pr_merge_commit_sha TEXT NOT NULL DEFAULT '',
 			status_summary TEXT NOT NULL DEFAULT '',
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			review_deadline_at TIMESTAMPTZ NULL,
+			pr_merged_at TIMESTAMPTZ NULL,
 			closed_at TIMESTAMPTZ NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_collab_sessions_phase_updated ON collab_sessions(phase, updated_at DESC)`,
@@ -319,6 +327,10 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 			role TEXT NOT NULL DEFAULT '',
 			status TEXT NOT NULL,
 			pitch TEXT NOT NULL DEFAULT '',
+			application_kind TEXT NOT NULL DEFAULT '',
+			evidence_url TEXT NOT NULL DEFAULT '',
+			verified BOOLEAN NOT NULL DEFAULT FALSE,
+			github_login TEXT NOT NULL DEFAULT '',
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			UNIQUE(collab_id, user_id)
@@ -349,11 +361,23 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_collab_events_collab_id ON collab_events(collab_id, id DESC)`,
 		// collab_sessions PR collaboration fields (multi-agent PR collab P0)
 		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'general'`,
+		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS author_user_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS pr_repo TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS pr_branch TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS pr_url TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS pr_number INT NOT NULL DEFAULT 0`,
 		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS pr_base_sha TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS pr_head_sha TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS required_reviewers INT NOT NULL DEFAULT 2`,
+		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS pr_author_login TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS github_pr_state TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS pr_merge_commit_sha TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS review_deadline_at TIMESTAMPTZ NULL`,
+		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS pr_merged_at TIMESTAMPTZ NULL`,
+		`ALTER TABLE collab_participants ADD COLUMN IF NOT EXISTS application_kind TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE collab_participants ADD COLUMN IF NOT EXISTS evidence_url TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE collab_participants ADD COLUMN IF NOT EXISTS verified BOOLEAN NOT NULL DEFAULT FALSE`,
+		`ALTER TABLE collab_participants ADD COLUMN IF NOT EXISTS github_login TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_collab_sessions_kind ON collab_sessions(kind, phase, updated_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS kb_entries (
 			id BIGSERIAL PRIMARY KEY,
@@ -1715,30 +1739,98 @@ func (s *PostgresStore) ListTokenLedger(ctx context.Context, botID string, limit
 	return items, rows.Err()
 }
 
+func scanCollabSession(scanner interface{ Scan(dest ...any) error }, item *CollabSession) error {
+	var reviewDeadline sql.NullTime
+	var mergedAt sql.NullTime
+	var closed sql.NullTime
+	if err := scanner.Scan(
+		&item.CollabID,
+		&item.Title,
+		&item.Goal,
+		&item.Kind,
+		&item.Complexity,
+		&item.Phase,
+		&item.ProposerUserID,
+		&item.AuthorUserID,
+		&item.OrchestratorUserID,
+		&item.MinMembers,
+		&item.MaxMembers,
+		&item.RequiredReviewers,
+		&item.PRRepo,
+		&item.PRBranch,
+		&item.PRURL,
+		&item.PRNumber,
+		&item.PRBaseSHA,
+		&item.PRHeadSHA,
+		&item.PRAuthorLogin,
+		&item.GitHubPRState,
+		&item.PRMergeCommitSHA,
+		&item.LastStatusOrSummary,
+		&item.CreatedAt,
+		&item.UpdatedAt,
+		&reviewDeadline,
+		&mergedAt,
+		&closed,
+	); err != nil {
+		return err
+	}
+	if reviewDeadline.Valid {
+		item.ReviewDeadlineAt = &reviewDeadline.Time
+	} else {
+		item.ReviewDeadlineAt = nil
+	}
+	if mergedAt.Valid {
+		item.PRMergedAt = &mergedAt.Time
+	} else {
+		item.PRMergedAt = nil
+	}
+	if closed.Valid {
+		item.ClosedAt = &closed.Time
+	} else {
+		item.ClosedAt = nil
+	}
+	return nil
+}
+
+func scanCollabParticipant(scanner interface{ Scan(dest ...any) error }, item *CollabParticipant) error {
+	return scanner.Scan(
+		&item.ID,
+		&item.CollabID,
+		&item.UserID,
+		&item.Role,
+		&item.Status,
+		&item.Pitch,
+		&item.ApplicationKind,
+		&item.EvidenceURL,
+		&item.Verified,
+		&item.GitHubLogin,
+		&item.CreatedAt,
+		&item.UpdatedAt,
+	)
+}
+
 func (s *PostgresStore) CreateCollabSession(ctx context.Context, item CollabSession) (CollabSession, error) {
 	item.CollabID = strings.TrimSpace(item.CollabID)
 	if item.CollabID == "" {
 		return CollabSession{}, fmt.Errorf("collab_id is required")
 	}
-	err := s.db.QueryRowContext(ctx, `
+	row := s.db.QueryRowContext(ctx, `
 		INSERT INTO collab_sessions(
-			collab_id, title, goal, kind, complexity, phase, proposer_user_id,
-			orchestrator_user_id, min_members, max_members,
-			pr_repo, pr_branch, pr_url, pr_base_sha, pr_head_sha,
-			status_summary, created_at, updated_at, closed_at
+			collab_id, title, goal, kind, complexity, phase, proposer_user_id, author_user_id,
+			orchestrator_user_id, min_members, max_members, required_reviewers,
+			pr_repo, pr_branch, pr_url, pr_number, pr_base_sha, pr_head_sha,
+			pr_author_login, github_pr_state, pr_merge_commit_sha,
+			status_summary, created_at, updated_at, review_deadline_at, pr_merged_at, closed_at
 		)
-		VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW(), NOW(), $17)
-		RETURNING collab_id, title, goal, kind, complexity, phase, proposer_user_id, orchestrator_user_id,
-			min_members, max_members, pr_repo, pr_branch, pr_url, pr_base_sha, pr_head_sha,
-			status_summary, created_at, updated_at, closed_at
-	`, item.CollabID, item.Title, item.Goal, item.Kind, item.Complexity, item.Phase, item.ProposerUserID, item.OrchestratorUserID,
-		item.MinMembers, item.MaxMembers, item.PRRepo, item.PRBranch, item.PRURL, item.PRBaseSHA, item.PRHeadSHA,
-		item.LastStatusOrSummary, item.ClosedAt).Scan(
-		&item.CollabID, &item.Title, &item.Goal, &item.Kind, &item.Complexity, &item.Phase, &item.ProposerUserID, &item.OrchestratorUserID,
-		&item.MinMembers, &item.MaxMembers, &item.PRRepo, &item.PRBranch, &item.PRURL, &item.PRBaseSHA, &item.PRHeadSHA,
-		&item.LastStatusOrSummary, &item.CreatedAt, &item.UpdatedAt, &item.ClosedAt,
-	)
-	if err != nil {
+		VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, NOW(), NOW(), $23, $24, $25)
+		RETURNING collab_id, title, goal, kind, complexity, phase, proposer_user_id, author_user_id, orchestrator_user_id,
+			min_members, max_members, required_reviewers, pr_repo, pr_branch, pr_url, pr_number, pr_base_sha, pr_head_sha,
+			pr_author_login, github_pr_state, pr_merge_commit_sha,
+			status_summary, created_at, updated_at, review_deadline_at, pr_merged_at, closed_at
+	`, item.CollabID, item.Title, item.Goal, item.Kind, item.Complexity, item.Phase, item.ProposerUserID, item.AuthorUserID, item.OrchestratorUserID,
+		item.MinMembers, item.MaxMembers, item.RequiredReviewers, item.PRRepo, item.PRBranch, item.PRURL, item.PRNumber, item.PRBaseSHA, item.PRHeadSHA,
+		item.PRAuthorLogin, item.GitHubPRState, item.PRMergeCommitSHA, item.LastStatusOrSummary, item.ReviewDeadlineAt, item.PRMergedAt, item.ClosedAt)
+	if err := scanCollabSession(row, &item); err != nil {
 		return CollabSession{}, err
 	}
 	return item, nil
@@ -1746,22 +1838,15 @@ func (s *PostgresStore) CreateCollabSession(ctx context.Context, item CollabSess
 
 func (s *PostgresStore) GetCollabSession(ctx context.Context, collabID string) (CollabSession, error) {
 	var item CollabSession
-	var closed sql.NullTime
-	err := s.db.QueryRowContext(ctx, `
-		SELECT collab_id, title, goal, kind, complexity, phase, proposer_user_id, orchestrator_user_id,
-			min_members, max_members, pr_repo, pr_branch, pr_url, pr_base_sha, pr_head_sha,
-			status_summary, created_at, updated_at, closed_at
+	row := s.db.QueryRowContext(ctx, `
+		SELECT collab_id, title, goal, kind, complexity, phase, proposer_user_id, author_user_id, orchestrator_user_id,
+			min_members, max_members, required_reviewers, pr_repo, pr_branch, pr_url, pr_number, pr_base_sha, pr_head_sha,
+			pr_author_login, github_pr_state, pr_merge_commit_sha,
+			status_summary, created_at, updated_at, review_deadline_at, pr_merged_at, closed_at
 		FROM collab_sessions WHERE collab_id = $1
-	`, strings.TrimSpace(collabID)).Scan(
-		&item.CollabID, &item.Title, &item.Goal, &item.Kind, &item.Complexity, &item.Phase, &item.ProposerUserID, &item.OrchestratorUserID,
-		&item.MinMembers, &item.MaxMembers, &item.PRRepo, &item.PRBranch, &item.PRURL, &item.PRBaseSHA, &item.PRHeadSHA,
-		&item.LastStatusOrSummary, &item.CreatedAt, &item.UpdatedAt, &closed,
-	)
-	if err != nil {
+	`, strings.TrimSpace(collabID))
+	if err := scanCollabSession(row, &item); err != nil {
 		return CollabSession{}, err
-	}
-	if closed.Valid {
-		item.ClosedAt = &closed.Time
 	}
 	return item, nil
 }
@@ -1774,9 +1859,10 @@ func (s *PostgresStore) ListCollabSessions(ctx context.Context, kind, phase, pro
 		limit = 500
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT collab_id, title, goal, kind, complexity, phase, proposer_user_id, orchestrator_user_id,
-			min_members, max_members, pr_repo, pr_branch, pr_url, pr_base_sha, pr_head_sha,
-			status_summary, created_at, updated_at, closed_at
+		SELECT collab_id, title, goal, kind, complexity, phase, proposer_user_id, author_user_id, orchestrator_user_id,
+			min_members, max_members, required_reviewers, pr_repo, pr_branch, pr_url, pr_number, pr_base_sha, pr_head_sha,
+			pr_author_login, github_pr_state, pr_merge_commit_sha,
+			status_summary, created_at, updated_at, review_deadline_at, pr_merged_at, closed_at
 		FROM collab_sessions
 		WHERE ($1 = '' OR kind = $1)
 		  AND ($2 = '' OR phase = $2)
@@ -1791,16 +1877,8 @@ func (s *PostgresStore) ListCollabSessions(ctx context.Context, kind, phase, pro
 	out := make([]CollabSession, 0)
 	for rows.Next() {
 		var it CollabSession
-		var closed sql.NullTime
-		if err := rows.Scan(
-			&it.CollabID, &it.Title, &it.Goal, &it.Kind, &it.Complexity, &it.Phase, &it.ProposerUserID, &it.OrchestratorUserID,
-			&it.MinMembers, &it.MaxMembers, &it.PRRepo, &it.PRBranch, &it.PRURL, &it.PRBaseSHA, &it.PRHeadSHA,
-			&it.LastStatusOrSummary, &it.CreatedAt, &it.UpdatedAt, &closed,
-		); err != nil {
+		if err := scanCollabSession(rows, &it); err != nil {
 			return nil, err
-		}
-		if closed.Valid {
-			it.ClosedAt = &closed.Time
 		}
 		out = append(out, it)
 	}
@@ -1809,8 +1887,7 @@ func (s *PostgresStore) ListCollabSessions(ctx context.Context, kind, phase, pro
 
 func (s *PostgresStore) UpdateCollabPhase(ctx context.Context, collabID, phase, orchestratorUserID, statusSummary string, closedAt *time.Time) (CollabSession, error) {
 	var item CollabSession
-	var closed sql.NullTime
-	err := s.db.QueryRowContext(ctx, `
+	row := s.db.QueryRowContext(ctx, `
 		UPDATE collab_sessions
 		SET phase = CASE WHEN $2 = '' THEN phase ELSE $2 END,
 			orchestrator_user_id = CASE WHEN $3 = '' THEN orchestrator_user_id ELSE $3 END,
@@ -1818,47 +1895,40 @@ func (s *PostgresStore) UpdateCollabPhase(ctx context.Context, collabID, phase, 
 			closed_at = $5,
 			updated_at = NOW()
 		WHERE collab_id = $1
-		RETURNING collab_id, title, goal, kind, complexity, phase, proposer_user_id, orchestrator_user_id,
-			min_members, max_members, pr_repo, pr_branch, pr_url, pr_base_sha, pr_head_sha,
-			status_summary, created_at, updated_at, closed_at
-	`, strings.TrimSpace(collabID), strings.TrimSpace(phase), strings.TrimSpace(orchestratorUserID), strings.TrimSpace(statusSummary), closedAt).Scan(
-		&item.CollabID, &item.Title, &item.Goal, &item.Kind, &item.Complexity, &item.Phase, &item.ProposerUserID, &item.OrchestratorUserID,
-		&item.MinMembers, &item.MaxMembers, &item.PRRepo, &item.PRBranch, &item.PRURL, &item.PRBaseSHA, &item.PRHeadSHA,
-		&item.LastStatusOrSummary, &item.CreatedAt, &item.UpdatedAt, &closed,
-	)
-	if err != nil {
+		RETURNING collab_id, title, goal, kind, complexity, phase, proposer_user_id, author_user_id, orchestrator_user_id,
+			min_members, max_members, required_reviewers, pr_repo, pr_branch, pr_url, pr_number, pr_base_sha, pr_head_sha,
+			pr_author_login, github_pr_state, pr_merge_commit_sha,
+			status_summary, created_at, updated_at, review_deadline_at, pr_merged_at, closed_at
+	`, strings.TrimSpace(collabID), strings.TrimSpace(phase), strings.TrimSpace(orchestratorUserID), strings.TrimSpace(statusSummary), closedAt)
+	if err := scanCollabSession(row, &item); err != nil {
 		return CollabSession{}, err
-	}
-	if closed.Valid {
-		item.ClosedAt = &closed.Time
 	}
 	return item, nil
 }
 
-func (s *PostgresStore) UpdateCollabPR(ctx context.Context, collabID, prBranch, prURL, prBaseSHA, prHeadSHA string) (CollabSession, error) {
+func (s *PostgresStore) UpdateCollabPR(ctx context.Context, input CollabPRUpdate) (CollabSession, error) {
 	var item CollabSession
-	var closed sql.NullTime
-	err := s.db.QueryRowContext(ctx, `
+	row := s.db.QueryRowContext(ctx, `
 		UPDATE collab_sessions
 		SET pr_branch = CASE WHEN $2 = '' THEN pr_branch ELSE $2 END,
 			pr_url = CASE WHEN $3 = '' THEN pr_url ELSE $3 END,
-			pr_base_sha = CASE WHEN $4 = '' THEN pr_base_sha ELSE $4 END,
-			pr_head_sha = CASE WHEN $5 = '' THEN pr_head_sha ELSE $5 END,
+			pr_number = CASE WHEN $4 <= 0 THEN pr_number ELSE $4 END,
+			pr_base_sha = CASE WHEN $5 = '' THEN pr_base_sha ELSE $5 END,
+			pr_head_sha = CASE WHEN $6 = '' THEN pr_head_sha ELSE $6 END,
+			pr_author_login = CASE WHEN $7 = '' THEN pr_author_login ELSE $7 END,
+			github_pr_state = CASE WHEN $8 = '' THEN github_pr_state ELSE $8 END,
+			pr_merge_commit_sha = CASE WHEN $9 = '' THEN pr_merge_commit_sha ELSE $9 END,
+			review_deadline_at = COALESCE($10, review_deadline_at),
+			pr_merged_at = COALESCE($11, pr_merged_at),
 			updated_at = NOW()
 		WHERE collab_id = $1
-		RETURNING collab_id, title, goal, kind, complexity, phase, proposer_user_id, orchestrator_user_id,
-			min_members, max_members, pr_repo, pr_branch, pr_url, pr_base_sha, pr_head_sha,
-			status_summary, created_at, updated_at, closed_at
-	`, strings.TrimSpace(collabID), strings.TrimSpace(prBranch), strings.TrimSpace(prURL), strings.TrimSpace(prBaseSHA), strings.TrimSpace(prHeadSHA)).Scan(
-		&item.CollabID, &item.Title, &item.Goal, &item.Kind, &item.Complexity, &item.Phase, &item.ProposerUserID, &item.OrchestratorUserID,
-		&item.MinMembers, &item.MaxMembers, &item.PRRepo, &item.PRBranch, &item.PRURL, &item.PRBaseSHA, &item.PRHeadSHA,
-		&item.LastStatusOrSummary, &item.CreatedAt, &item.UpdatedAt, &closed,
-	)
-	if err != nil {
+		RETURNING collab_id, title, goal, kind, complexity, phase, proposer_user_id, author_user_id, orchestrator_user_id,
+			min_members, max_members, required_reviewers, pr_repo, pr_branch, pr_url, pr_number, pr_base_sha, pr_head_sha,
+			pr_author_login, github_pr_state, pr_merge_commit_sha,
+			status_summary, created_at, updated_at, review_deadline_at, pr_merged_at, closed_at
+	`, strings.TrimSpace(input.CollabID), strings.TrimSpace(input.PRBranch), strings.TrimSpace(input.PRURL), input.PRNumber, strings.TrimSpace(input.PRBaseSHA), strings.TrimSpace(input.PRHeadSHA), strings.TrimSpace(input.PRAuthorLogin), strings.TrimSpace(input.GitHubPRState), strings.TrimSpace(input.PRMergeCommitSHA), input.ReviewDeadlineAt, input.PRMergedAt)
+	if err := scanCollabSession(row, &item); err != nil {
 		return CollabSession{}, err
-	}
-	if closed.Valid {
-		item.ClosedAt = &closed.Time
 	}
 	return item, nil
 }
@@ -1869,19 +1939,21 @@ func (s *PostgresStore) UpsertCollabParticipant(ctx context.Context, item Collab
 	if item.CollabID == "" || item.UserID == "" {
 		return CollabParticipant{}, fmt.Errorf("collab_id and user_id are required")
 	}
-	err := s.db.QueryRowContext(ctx, `
-		INSERT INTO collab_participants(collab_id, user_id, role, status, pitch, created_at, updated_at)
-		VALUES($1, $2, $3, $4, $5, NOW(), NOW())
+	row := s.db.QueryRowContext(ctx, `
+		INSERT INTO collab_participants(collab_id, user_id, role, status, pitch, application_kind, evidence_url, verified, github_login, created_at, updated_at)
+		VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
 		ON CONFLICT (collab_id, user_id) DO UPDATE SET
 			role = EXCLUDED.role,
 			status = EXCLUDED.status,
 			pitch = EXCLUDED.pitch,
+			application_kind = EXCLUDED.application_kind,
+			evidence_url = EXCLUDED.evidence_url,
+			verified = EXCLUDED.verified,
+			github_login = EXCLUDED.github_login,
 			updated_at = NOW()
-		RETURNING id, collab_id, user_id, role, status, pitch, created_at, updated_at
-	`, item.CollabID, item.UserID, item.Role, item.Status, item.Pitch).Scan(
-		&item.ID, &item.CollabID, &item.UserID, &item.Role, &item.Status, &item.Pitch, &item.CreatedAt, &item.UpdatedAt,
-	)
-	if err != nil {
+		RETURNING id, collab_id, user_id, role, status, pitch, application_kind, evidence_url, verified, github_login, created_at, updated_at
+	`, item.CollabID, item.UserID, item.Role, item.Status, item.Pitch, item.ApplicationKind, item.EvidenceURL, item.Verified, item.GitHubLogin)
+	if err := scanCollabParticipant(row, &item); err != nil {
 		return CollabParticipant{}, err
 	}
 	return item, nil
@@ -1895,7 +1967,7 @@ func (s *PostgresStore) ListCollabParticipants(ctx context.Context, collabID, st
 		limit = 5000
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, collab_id, user_id, role, status, pitch, created_at, updated_at
+		SELECT id, collab_id, user_id, role, status, pitch, application_kind, evidence_url, verified, github_login, created_at, updated_at
 		FROM collab_participants
 		WHERE ($1 = '' OR collab_id = $1)
 		  AND ($2 = '' OR status = $2)
@@ -1909,7 +1981,7 @@ func (s *PostgresStore) ListCollabParticipants(ctx context.Context, collabID, st
 	out := make([]CollabParticipant, 0)
 	for rows.Next() {
 		var it CollabParticipant
-		if err := rows.Scan(&it.ID, &it.CollabID, &it.UserID, &it.Role, &it.Status, &it.Pitch, &it.CreatedAt, &it.UpdatedAt); err != nil {
+		if err := scanCollabParticipant(rows, &it); err != nil {
 			return nil, err
 		}
 		out = append(out, it)

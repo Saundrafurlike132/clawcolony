@@ -992,25 +992,43 @@ func (s *InMemoryStore) UpdateCollabPhase(_ context.Context, collabID, phase, or
 	return it, nil
 }
 
-func (s *InMemoryStore) UpdateCollabPR(_ context.Context, collabID, prBranch, prURL, prBaseSHA, prHeadSHA string) (CollabSession, error) {
+func (s *InMemoryStore) UpdateCollabPR(_ context.Context, input CollabPRUpdate) (CollabSession, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	it, ok := s.collab[strings.TrimSpace(collabID)]
+	it, ok := s.collab[strings.TrimSpace(input.CollabID)]
 	if !ok {
 		return CollabSession{}, fmt.Errorf("collab not found")
 	}
 	now := time.Now().UTC()
-	if strings.TrimSpace(prBranch) != "" {
-		it.PRBranch = strings.TrimSpace(prBranch)
+	if strings.TrimSpace(input.PRBranch) != "" {
+		it.PRBranch = strings.TrimSpace(input.PRBranch)
 	}
-	if strings.TrimSpace(prURL) != "" {
-		it.PRURL = strings.TrimSpace(prURL)
+	if strings.TrimSpace(input.PRURL) != "" {
+		it.PRURL = strings.TrimSpace(input.PRURL)
 	}
-	if strings.TrimSpace(prBaseSHA) != "" {
-		it.PRBaseSHA = strings.TrimSpace(prBaseSHA)
+	if input.PRNumber > 0 {
+		it.PRNumber = input.PRNumber
 	}
-	if strings.TrimSpace(prHeadSHA) != "" {
-		it.PRHeadSHA = strings.TrimSpace(prHeadSHA)
+	if strings.TrimSpace(input.PRBaseSHA) != "" {
+		it.PRBaseSHA = strings.TrimSpace(input.PRBaseSHA)
+	}
+	if strings.TrimSpace(input.PRHeadSHA) != "" {
+		it.PRHeadSHA = strings.TrimSpace(input.PRHeadSHA)
+	}
+	if strings.TrimSpace(input.PRAuthorLogin) != "" {
+		it.PRAuthorLogin = strings.TrimSpace(input.PRAuthorLogin)
+	}
+	if strings.TrimSpace(input.GitHubPRState) != "" {
+		it.GitHubPRState = strings.TrimSpace(input.GitHubPRState)
+	}
+	if strings.TrimSpace(input.PRMergeCommitSHA) != "" {
+		it.PRMergeCommitSHA = strings.TrimSpace(input.PRMergeCommitSHA)
+	}
+	if input.ReviewDeadlineAt != nil {
+		it.ReviewDeadlineAt = input.ReviewDeadlineAt
+	}
+	if input.PRMergedAt != nil {
+		it.PRMergedAt = input.PRMergedAt
 	}
 	it.UpdatedAt = now
 	s.collab[it.CollabID] = it
@@ -1031,6 +1049,10 @@ func (s *InMemoryStore) UpsertCollabParticipant(_ context.Context, item CollabPa
 			s.collabParts[i].Role = item.Role
 			s.collabParts[i].Status = item.Status
 			s.collabParts[i].Pitch = item.Pitch
+			s.collabParts[i].ApplicationKind = item.ApplicationKind
+			s.collabParts[i].EvidenceURL = item.EvidenceURL
+			s.collabParts[i].Verified = item.Verified
+			s.collabParts[i].GitHubLogin = item.GitHubLogin
 			s.collabParts[i].UpdatedAt = now
 			return s.collabParts[i], nil
 		}

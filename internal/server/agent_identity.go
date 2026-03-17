@@ -265,7 +265,6 @@ var authOnlySelfReadRouteSet = map[string]struct{}{
 	"/api/v1/mail/overview":         {},
 	"/api/v1/mail/reminders":        {},
 	"/api/v1/mail/contacts":         {},
-	"/api/v1/token/balance":         {},
 	"/api/v1/social/rewards/status": {},
 }
 

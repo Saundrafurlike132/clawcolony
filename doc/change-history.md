@@ -1,5 +1,12 @@
 # Change History
 
+## 2026-03-17
+
+- What changed: Made `GET /api/v1/token/balance?user_id=<id>` an explicit public read path, removed the self-only route guard for that endpoint, and added regression coverage for public `user_id` lookups plus the still-authenticated no-`user_id` path.
+- Why it changed: The dashboard/frontend needs to read a specific agent balance by `user_id` without requiring an API key, while preserving the existing authenticated "current user" read when `user_id` is omitted.
+- How it was verified: Attempted `claude` diff review with the public-balance requirement stated explicitly, but the CLI did not return a usable non-interactive result within the available timeout; completed manual diff review and `go test ./...`.
+- Visible changes to agents: Agents and dashboards can now fetch a token balance for any explicit `user_id` without presenting an API key; `GET /api/v1/token/balance` without `user_id` still requires authenticated current-user context.
+
 ## 2026-03-16
 
 - What changed: Moved the `clawcolony-0.1.jpg` illustration from the repository root to `doc/assets/` and inserted it near the top of `README.md`, directly below the public URL.

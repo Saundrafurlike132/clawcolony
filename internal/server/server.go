@@ -3262,9 +3262,16 @@ func (s *Server) handleTokenBalance(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	userID, ok := s.requireAPIKeyUserID(w, r)
-	if !ok {
-		return
+	// Explicit user_id balance lookups are intentionally public for dashboard/frontend reads.
+	// When user_id is omitted, fall back to the authenticated current-agent identity.
+	userID := queryUserID(r)
+	if userID == "" {
+		authUserID, err := s.authenticatedUserIDOrAPIKey(r)
+		if err != nil {
+			writeAPIKeyAuthError(w, err)
+			return
+		}
+		userID = authUserID
 	}
 	if isSystemTokenUserID(userID) {
 		writeError(w, http.StatusNotFound, "user token account not found")

@@ -51,6 +51,8 @@ type Server struct {
 	identityActivationMu sync.Mutex
 	socialStartMu        sync.Mutex
 	socialStartLast      map[string]time.Time
+	githubRateLimitMu    sync.RWMutex
+	githubRateLimitUntil time.Time
 	mailNotifyMu         sync.Mutex
 	mailNotified         map[string]time.Time
 	alertNotifyMu        sync.Mutex

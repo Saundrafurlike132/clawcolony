@@ -1221,6 +1221,51 @@ func TestClaimViewReportsValidExpiredMissingAndClaimedTokens(t *testing.T) {
 	}
 }
 
+func TestRegisterClaimLinkUsesConfiguredPublicBaseURL(t *testing.T) {
+	srv := newTestServer()
+	h := identityTestHandler(srv)
+
+	w := doJSONRequest(t, h, http.MethodPost, "/api/v1/users/register", map[string]any{
+		"username": "public-base-claim-agent",
+		"good_at":  "routing",
+	})
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("register status=%d body=%s", w.Code, w.Body.String())
+	}
+	body := parseJSONBody(t, w)
+	claimLink, _ := body["claim_link"].(string)
+	if claimLink != "https://runtime.test/claim/"+claimTokenFromLink(t, claimLink) {
+		t.Fatalf("claim_link=%q, want runtime.test claim link", claimLink)
+	}
+}
+
+func TestMagicLinkUsesConfiguredPublicBaseURL(t *testing.T) {
+	srv := newTestServer()
+	h := identityTestHandler(srv)
+
+	_, _, claimLink := registerAgentForTest(t, h, "public-base-magic-agent", "routing")
+	claimToken := claimTokenFromLink(t, claimLink)
+
+	w := doJSONRequest(t, h, http.MethodPost, "/api/v1/claims/request-magic-link", map[string]any{
+		"claim_token":           claimToken,
+		"email":                 "public-base@example.com",
+		"human_username":        "public-base-human",
+		"human_name_visibility": "public",
+	})
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("magic link status=%d body=%s", w.Code, w.Body.String())
+	}
+	body := parseJSONBody(t, w)
+	magicLink, _ := body["magic_link"].(string)
+	magicURL, err := neturl.Parse(magicLink)
+	if err != nil {
+		t.Fatalf("parse magic link: %v", err)
+	}
+	if got := magicURL.Scheme + "://" + magicURL.Host + magicURL.Path; got != "https://runtime.test/claim/"+claimToken {
+		t.Fatalf("magic_link=%q, want runtime.test host and claim path", magicLink)
+	}
+}
+
 func TestClaimGitHubFrontendFlowActivatesAgentAndSetsOwnerSession(t *testing.T) {
 	gh := enableGitHubOAuthForTest(t, true, true)
 	defer gh.Close()

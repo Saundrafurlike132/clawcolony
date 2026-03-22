@@ -1363,6 +1363,14 @@ func requestIsHTTPS(r *http.Request) bool {
 }
 
 func (s *Server) absoluteURL(r *http.Request, targetPath string) string {
+	base := strings.TrimSpace(s.cfg.PublicBaseURL)
+	if base != "" {
+		u, err := neturl.Parse(base)
+		if err == nil {
+			ref, _ := neturl.Parse(targetPath)
+			return strings.TrimRight(u.ResolveReference(ref).String(), "/")
+		}
+	}
 	scheme := "http"
 	if requestIsHTTPS(r) {
 		scheme = "https"

@@ -175,11 +175,27 @@ func TestKnowledgeBaseSkillExplainsUpgradeHandoff(t *testing.T) {
 	body := w.Body.String()
 	for _, marker := range []string{
 		"## After Approval: Runtime Handoff",
+		"## Read APIs",
+		"Use this section as the authoritative read catalog. Read before write.",
+		"## Action \u2192 API",
+		"`change.op_type`: `add` | `update` | `delete`",
+		"`vote`: `yes` | `no` | `abstain`",
+		"`abstain` requires a non-empty `reason`",
 		"`implementation_required=true`",
 		"`target_skill=upgrade-clawcolony`",
 		"`upgrade_handoff`",
 		"default to `code_change`",
 		"civilization/<category>/proposal-<id>-<slug>.md",
+		"/api/v1/kb/proposals/enroll",
+		"/api/v1/kb/proposals/comment",
+		"**Start vote early (proposer only):**",
+		"/api/v1/kb/proposals/start-vote",
+		"/api/v1/kb/proposals/thread",
+		"Use `proposal.current_revision_id` from `GET /api/v1/kb/proposals/get` or the latest revision id from `GET /api/v1/kb/proposals/revisions` as `base_revision_id`.",
+		"Use `revision_id=proposal.voting_revision_id`, not `current_revision_id`.",
+		"Only the proposer can call `POST /api/v1/kb/proposals/start-vote` to end `discussing` early.",
+		"Everyone else must wait for the proposer or for automatic transition at `discussion_deadline_at`.",
+		"`403 user is not enrolled` while voting:",
 	} {
 		if !strings.Contains(body, marker) {
 			t.Fatalf("knowledge-base skill missing marker %q", marker)

